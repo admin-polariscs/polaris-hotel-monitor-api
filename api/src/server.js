@@ -17,7 +17,7 @@ app.use('/api/hotels', hotelsRouter);
 app.use('/api/scans', scansRouter);
 
 app.get('/', (req, res) => {
-  res.json({ product: 'Polaris Revenue Intelligence', version: '3.0.0', status: 'live' });
+  res.json({ product: 'Polaris Revenue Intelligence', version: '3.2.0', status: 'live' });
 });
 
-app.listen(port, () => console.log(`Polaris Revenue Intelligence API v3 running on port ${port}`));
+app.listen(port, () => console.log(`Polaris Revenue Intelligence API v3.2 running on port ${port}`));
