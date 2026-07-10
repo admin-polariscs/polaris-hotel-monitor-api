@@ -1,1 +1,18 @@
-{"name":"polaris-revenue-intelligence-api","version":"3.3.0","type":"module","scripts":{"start":"node src/server.js"},"dependencies":{"@openai/openai":"latest","cheerio":"latest","cors":"latest","express":"latest","zod":"latest"},"engines":{"node":">=20"}}
+{
+  "name": "polaris-revenue-intelligence-api",
+  "version": "3.3.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "openai": "^4.104.0",
+    "zod": "^3.24.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
