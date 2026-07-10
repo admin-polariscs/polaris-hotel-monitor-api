@@ -1,0 +1,24 @@
+{
+  "name": "polaris-hotel-monitor-v1",
+  "version": "1.0.0",
+  "description": "Polaris Hotel Revenue & Trust Monitor v1 - URL scanner with AI-ready reports",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "start:prod": "NODE_ENV=production node src/server.js",
+    "pm2": "pm2 start src/server.js --name polaris-hotel-monitor"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "cheerio": "^1.0.0",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "jsdom": "^24.1.1",
+    "openai": "^4.104.0",
+    "playwright": "^1.54.1",
+    "validator": "^13.12.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {}
+}
