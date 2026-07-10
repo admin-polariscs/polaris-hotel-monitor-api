@@ -117,7 +117,7 @@ async function browserSignals(url) {
   let browser;
   try {
     browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, userAgent: 'PolarisHotelMonitor/1.0' });
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, userAgent: 'PolarisHotelMonitor/1.1' });
     const requests = [];
     page.on('request', req => requests.push(req.url()));
     const start = Date.now();
@@ -137,7 +137,7 @@ async function browserSignals(url) {
 export async function scanHotel(inputUrl) {
   const url = normalizeUrl(inputUrl);
   const startedAt = new Date().toISOString();
-  const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(TIMEOUT), headers: { 'user-agent': 'PolarisHotelMonitor/1.0' } });
+  const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(TIMEOUT), headers: { 'user-agent': 'PolarisHotelMonitor/1.1' } });
   const finalUrl = res.url;
   const html = await res.text();
   const headers = Object.fromEntries(res.headers.entries());
@@ -168,7 +168,7 @@ export async function scanHotel(inputUrl) {
   };
   const score = scoreFromChecks(checks);
   return {
-    product: 'Polaris Hotel Revenue & Trust Monitor', version: '1.0.0', startedAt, scannedUrl: url, finalUrl,
+    product: 'Polaris Hotel Revenue & Trust Monitor', version: '1.1.0', startedAt, scannedUrl: url, finalUrl,
     status: { code: res.status, ok: res.ok, redirected: finalUrl !== url },
     score, checks, security, booking, tracking: { found: trackingSignals, trackingBeforeConsentRisk: !!browser.trackingBeforeConsent },
     cookies: { signalsFound: cookieSignals }, seo, schema, accessibility, geo,

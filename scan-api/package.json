@@ -1,7 +1,7 @@
 {
   "name": "polaris-hotel-monitor-v1",
-  "version": "1.0.0",
-  "description": "Polaris Hotel Revenue & Trust Monitor v1 - URL scanner with AI-ready reports",
+  "version": "1.1.0",
+  "description": "Polaris Hotel Revenue & Trust Monitor v1.1 - URL scanner with AI reports, lead capture and HTML/PDF report export",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
