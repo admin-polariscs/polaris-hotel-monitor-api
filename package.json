@@ -1,1 +1,0 @@
-{"name":"polaris-revenue-intelligence-api","version":"3.3.0","type":"module","scripts":{"start":"node src/server.js"},"dependencies":{"@openai/openai":"latest","cheerio":"latest","cors":"latest","express":"latest","zod":"latest"},"engines":{"node":">=20"}}
