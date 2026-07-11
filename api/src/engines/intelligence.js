@@ -8,7 +8,7 @@ function normaliseUrl(input){
 }
 async function fetchHtml(url){
   const started = Date.now();
-  const r = await fetch(url,{headers:{'user-agent':'Mozilla/5.0 PolarisRevenueIntelligence/3.3'}});
+  const r = await fetch(url,{headers:{'user-agent':'Mozilla/5.0 PolarisRevenueIntelligence/3.5'}});
   const html = await r.text();
   return {status:r.status,html,responseMs:Date.now()-started,finalUrl:r.url,headers:Object.fromEntries(r.headers)};
 }
@@ -17,19 +17,64 @@ function attr($,sel,a){return ($(sel).first().attr(a)||'').trim()}
 function parseJsonLd($){
   const items=[];$('script[type="application/ld+json"]').each((_,el)=>{try{let raw=$(el).contents().text();let json=JSON.parse(raw);items.push(...(Array.isArray(json)?json:[json]));}catch{}});return items;
 }
+
+// Improved hotel identity extraction (V3.5).
+// Prefers structured schema.org Hotel/LodgingBusiness/LocalBusiness data over regex guessing.
+// Falls back to meta tags and a small text-based city guess only when structured data is missing.
 function hotelEntity(url,$){
-  const jsonld=parseJsonLd($); const flat=JSON.stringify(jsonld).slice(0,6000);
+  const jsonld=parseJsonLd($);
+  const flat=JSON.stringify(jsonld).slice(0,6000);
   const hotelLike=jsonld.find(x=>/Hotel|LodgingBusiness|LocalBusiness/.test(JSON.stringify(x?.['@type']||'')))||{};
+  const schemaOrgType = hotelLike['@type'] ? (Array.isArray(hotelLike['@type'])?hotelLike['@type']:[hotelLike['@type']]) : [];
+
   const name = hotelLike.name || attr($,'meta[property="og:site_name"]','content') || attr($,'meta[property="og:title"]','content') || text($,'title');
   const desc = hotelLike.description || attr($,'meta[name="description"]','content') || attr($,'meta[property="og:description"]','content');
-  let address = '';
-  if(typeof hotelLike.address==='string') address=hotelLike.address;
-  else if(hotelLike.address) address=[hotelLike.address.streetAddress,hotelLike.address.postalCode,hotelLike.address.addressLocality,hotelLike.address.addressCountry].filter(Boolean).join(', ');
+
+  let streetAddress='', postalCode='', addressLocality='', addressCountry='', address='';
+  if(typeof hotelLike.address==='string'){
+    address=hotelLike.address;
+  } else if(hotelLike.address && typeof hotelLike.address==='object'){
+    streetAddress = hotelLike.address.streetAddress || '';
+    postalCode = hotelLike.address.postalCode || '';
+    addressLocality = hotelLike.address.addressLocality || '';
+    addressCountry = typeof hotelLike.address.addressCountry === 'string' ? hotelLike.address.addressCountry : (hotelLike.address.addressCountry?.name || '');
+    address = [streetAddress, postalCode, addressLocality, addressCountry].filter(Boolean).join(', ');
+  }
+
   const tel = hotelLike.telephone || attr($,'a[href^="tel:"]','href').replace(/^tel:/,'');
   const body=$('body').text().replace(/\s+/g,' ').slice(0,12000);
-  const city = (address.match(/,\s*([^,]+)\s*,?\s*(Belgium|Belgique|België|BE)?$/i)||[])[1] || (body.match(/Brussels|Bruxelles|Antwerp|Ghent|Gent|Bruges|Liège|Namur/i)||[])[0] || '';
-  return {name:name?.replace(/[-|].*$/,'').trim()||new URL(url).hostname,address,city,telephone:tel,description:desc,confidence: name?82:45,rawSignals:{jsonLdTypes:jsonld.map(x=>x['@type']).filter(Boolean).slice(0,8),jsonLdFound:jsonld.length,flatPreview:flat.slice(0,300)}};
+  const ogLocality = attr($,'meta[property="og:locality"]','content');
+
+  // City resolution order: structured schema.org locality > og:locality meta > loose regex on address/body (last resort, kept from V3.3).
+  const city = addressLocality || ogLocality || (address.match(/,\s*([^,]+)\s*,?\s*(Belgium|Belgique|België|BE)?$/i)||[])[1] || (body.match(/Brussels|Bruxelles|Antwerp|Ghent|Gent|Bruges|Liège|Namur/i)||[])[0] || '';
+
+  let domain = '';
+  try { domain = new URL(url).hostname.replace(/^www\./,''); } catch {}
+
+  let confidence = 40;
+  if (schemaOrgType.length) confidence += 20;
+  if (hotelLike.name) confidence += 15;
+  if (address) confidence += 10;
+  if (city) confidence += 5;
+  if (tel) confidence += 5;
+  confidence = Math.min(confidence, 95);
+
+  return {
+    name: name?.replace(/[-|].*$/,'').trim() || new URL(url).hostname,
+    domain,
+    address,
+    streetAddress,
+    postalCode,
+    city,
+    country: addressCountry,
+    telephone: tel,
+    description: desc,
+    schemaOrgType,
+    confidence,
+    rawSignals:{jsonLdTypes:jsonld.map(x=>x['@type']).filter(Boolean).slice(0,8),jsonLdFound:jsonld.length,flatPreview:flat.slice(0,300)}
+  };
 }
+
 function websiteSignals($,html,meta){
   const links=[];$('a[href]').each((_,a)=>links.push($(a).attr('href')));
   const imgs=[];$('img').each((_,i)=>imgs.push($(i).attr('src')||$(i).attr('data-src')||''));
@@ -42,15 +87,38 @@ async function pagespeed(url){
   const key=process.env.PAGESPEED_API_KEY; if(!key) return {available:false,reason:'No PAGESPEED_API_KEY configured'};
   const api=`https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&category=performance&key=${encodeURIComponent(key)}`;
   try{const r=await fetch(api); const j=await r.json(); if(!r.ok) return {available:false,reason:j?.error?.message||'PageSpeed request failed'};
-    const lh=j.lighthouseResult; const audits=lh.audits; const num=id=>audits[id]?.numericValue; const display=id=>audits[id]?.displayValue||'';
-    return {available:true,score:Math.round((lh.categories.performance.score||0)*100),metrics:{fcp:display('first-contentful-paint'),lcp:display('largest-contentful-paint'),cls:display('cumulative-layout-shift'),tbt:display('total-blocking-time'),speedIndex:display('speed-index')},opportunities:Object.values(audits).filter(a=>a.details?.type==='opportunity'&&a.score!==1).slice(0,5).map(a=>({title:a.title,displayValue:a.displayValue||'',description:a.description?.replace(/<[^>]+>/g,'').slice(0,180)}))};
+  const lh=j.lighthouseResult; const audits=lh.audits; const num=id=>audits[id]?.numericValue; const display=id=>audits[id]?.displayValue||'';
+  return {available:true,score:Math.round((lh.categories.performance.score||0)*100),metrics:{fcp:display('first-contentful-paint'),lcp:display('largest-contentful-paint'),cls:display('cumulative-layout-shift'),tbt:display('total-blocking-time'),speedIndex:display('speed-index')},opportunities:Object.values(audits).filter(a=>a.details?.type==='opportunity'&&a.score!==1).slice(0,5).map(a=>({title:a.title,displayValue:a.displayValue||'',description:a.description?.replace(/<[^>]+>/g,'').slice(0,180)}))};
   }catch(e){return {available:false,reason:e.message};}
 }
+
+// V3.5 OTA discovery: builds non-aggressive, search-style candidate URLs for each platform.
+// We deliberately do NOT fetch or scrape these search URLs ourselves - that would mean
+// automatically querying Google's search results, which we avoid entirely. Confidence is
+// therefore based only on how much real hotel identity data we extracted, and every
+// candidate defaults to verificationStatus='unverified' until a real Places/SERP API
+// integration can confirm a match. verified is always false at this stage.
 function discoverOtas(entity){
+  const hasName = !!entity.name;
   const q=[entity.name, entity.city||'', entity.address||''].filter(Boolean).join(' ');
   const enc=encodeURIComponent(q);
   const platforms=[['Booking.com','booking.com'],['Expedia','expedia.com'],['Hotels.com','hotels.com'],['Tripadvisor','tripadvisor.com'],['Agoda','agoda.com'],['Google Hotels','google.com/travel/hotels']];
-  return platforms.map(([name,domain])=>({name,domain,status:'discovery-ready',confidence: entity.name?70:35,searchUrl:`https://www.google.com/search?q=${enc}+site:${encodeURIComponent(domain)}`,note:'Automatic public discovery prepared. Add SERP/Places API later for verified URLs.'}));
+  return platforms.map(([name,domain])=>{
+    let confidence = hasName ? 35 : 15;
+    if (entity.city) confidence += 15;
+    if (entity.address) confidence += 10;
+    if (entity.schemaOrgType && entity.schemaOrgType.length) confidence += 10;
+    confidence = Math.max(0, Math.min(confidence, 80));
+    return {
+      name,
+      domain,
+      status:'discovery-ready',
+      confidence,
+      searchUrl:`https://www.google.com/search?q=${enc}+site:${encodeURIComponent(domain)}`,
+      note:'Automatic public discovery candidate prepared. Not yet confirmed as a real listing - add a SERP/Places API to verify matches automatically.',
+      verificationStatus:'unverified'
+    };
+  });
 }
 function discoverCompetitors(entity){
   const city=entity.city||'nearby'; const base=entity.name||'this hotel';
