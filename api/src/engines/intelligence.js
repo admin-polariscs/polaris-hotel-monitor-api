@@ -152,7 +152,8 @@ const ai = await aiEntityFallback(ws);
 if(!ai || !ai.hotel_name) return entity;
 const refined = { ...entity };
 let changed = false;
-if(entity.nameSource==='domain_fallback'){
+const weakNameSource = entity.nameSource==='domain_fallback' || entity.nameSource==='h1' || entity.nameSource==='title_cleaned';
+if(weakNameSource && ai.confidence>=60){
 refined.name = ai.hotel_name; refined.nameSource='openai_fallback'; changed = true;
 }
 if(!entity.city && ai.city){ refined.city = ai.city; changed = true; }
