@@ -10,19 +10,6 @@ app.use(express.json({ limit:'2mb' }));
 
 const scans = [];
 app.get('/health', (req,res)=>res.json({ok:true,product:'Polaris Revenue Intelligence',version:'3.3.0',openai:!!process.env.OPENAI_API_KEY,pagespeed:!!process.env.PAGESPEED_API_KEY}));
-app.get('/debug/db', async (req,res)=>{
-  if(req.query.token !== process.env.DEBUG_TOKEN){ return res.status(403).json({error:'Forbidden'}); }
-  try{
-    const { Client } = await import('pg');
-    const client = new Client({ connectionString: process.env.DATABASE_URL });
-    await client.connect();
-    const result = await client.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name");
-    await client.end();
-    res.json({ database:'connected', tables: result.rows.map(r=>r.table_name) });
-  }catch(e){
-    res.status(500).json({ database:'error', message: e.message });
-  }
-});
 app.post('/scan', async (req,res)=>{
   try{
     const { url } = req.body || {};
