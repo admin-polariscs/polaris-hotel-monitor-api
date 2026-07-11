@@ -92,17 +92,17 @@ async function persistScan({ scanRecord, hotelRecord, result }) {
     }
 
   if (result.ota && Array.isArray(result.ota.items)) {
-        for (const item of result.ota.items) {
-                await storeDiscoveredListing({
-                          hotelId: hotelRecord.id,
-                          platform: item.name,
-                          url: item.searchUrl || null,
-                          confidence: item.confidence,
-                          verified: false,
-                          status: item.verificationStatus || 'unverified',
-                          rawData: item
-                });
-        }
+		for (const item of result.ota.items) {
+				await storeDiscoveredListing({
+							hotelId: hotelRecord.id,
+							platform: item.name,
+							url: item.listingUrl || null,
+							confidence: item.confidence,
+							verified: false,
+							status: item.listingUrl ? (item.verificationStatus || 'unverified') : (item.status || 'discovery_candidate'),
+							rawData: { ...item, search_query: item.searchQuery || null, search_url: item.searchUrl || null }
+				});
+		}
   }
 
   if (result.competitors && Array.isArray(result.competitors.items)) {
@@ -217,14 +217,22 @@ app.get('/hotels/:id/discovery', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' });
   try {
     const listings = await pool.query(
-      'SELECT id, platform, url, confidence, verified, status, first_seen_at, last_seen_at FROM discovered_listings WHERE hotel_id = $1 ORDER BY id DESC LIMIT 100',
+      'SELECT id, platform, url, confidence, verified, status, raw_data, first_seen_at, last_seen_at FROM discovered_listings WHERE hotel_id = $1 ORDER BY id DESC LIMIT 100',
       [req.params.id]
     );
     const comps = await pool.query(
       'SELECT id, name, website, city, platform_source, confidence, distance_km, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 ORDER BY id DESC LIMIT 100',
       [req.params.id]
     );
-    res.json({ discoveredListings: listings.rows, competitors: comps.rows });
+    // Human-readable wording so the frontend/API never implies a search-style candidate is a
+    // confirmed OTA listing. Only rows with a real url are described as a listing being found.
+    const discoveredListings = listings.rows.map((row) => {
+      const message = row.url
+        ? (row.verified ? `${row.platform} listing verified` : `${row.platform} listing found (not yet verified)`)
+        : `${row.platform} discovery candidate prepared`;
+      return { ...row, message };
+    });
+    res.json({ discoveredListings, competitors: comps.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch discovery data', message: err.message });
   }
