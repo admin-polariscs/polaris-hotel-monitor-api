@@ -229,6 +229,26 @@ app.get('/hotels/:id/scans', async (req, res) => {
     }
 });
 
+app.get('/debug/data', async (req, res) => {
+      if (req.query.token !== process.env.DEBUG_TOKEN) {
+              return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!pool) return res.status(503).json({ error: 'Database not configured' });
+      try {
+              const counts = {};
+              for (const table of ['hotels', 'scans', 'scan_results', 'discovered_listings', 'competitors']) {
+                        const c = await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
+                        counts[table] = c.rows[0].count;
+              }
+              const scanResults = await pool.query('SELECT id, scan_id, section, score, summary FROM scan_results ORDER BY id DESC LIMIT 20');
+              const listings = await pool.query('SELECT id, hotel_id, platform, url, confidence, verified, status FROM discovered_listings ORDER BY id DESC LIMIT 20');
+              const comps = await pool.query('SELECT id, hotel_id, name, website, confidence FROM competitors ORDER BY id DESC LIMIT 20');
+              res.json({ counts, scanResults: scanResults.rows, discoveredListings: listings.rows, competitors: comps.rows });
+      } catch (error) {
+              res.status(500).json({ error: error.message });
+      }
+});
+
 app.listen(port, () => {
     console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
 });
