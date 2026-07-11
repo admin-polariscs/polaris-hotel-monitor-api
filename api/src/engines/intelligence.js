@@ -80,9 +80,11 @@ const rawTitle = text($,'title');
 const titleCleaned = cleanTitleForName(rawTitle);
 
 let name='', nameSource='';
+const ogSiteNameCleaned = cleanTitleForName(ogSiteName);
+const ogTitleCleaned = cleanTitleForName(ogTitle);
 if(hotelLike.name){ name=hotelLike.name; nameSource='schema_org'; }
-else if(ogSiteName){ name=ogSiteName; nameSource='og_site_name'; }
-else if(ogTitle){ name=ogTitle; nameSource='og_title'; }
+else if(ogSiteNameCleaned){ name=ogSiteNameCleaned; nameSource='og_site_name'; }
+else if(ogTitleCleaned){ name=ogTitleCleaned; nameSource='og_title'; }
 else if(h1Text){ name=h1Text; nameSource='h1'; }
 else if(titleCleaned){ name=titleCleaned; nameSource='title_cleaned'; }
 
