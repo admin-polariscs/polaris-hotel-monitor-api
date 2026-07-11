@@ -99,7 +99,7 @@ async function persistScan({ scanRecord, hotelRecord, result }) {
                           url: item.searchUrl || null,
                           confidence: item.confidence,
                           verified: false,
-                          status: item.status || 'discovered',
+                          status: item.verificationStatus || 'unverified',
                           rawData: item
                 });
         }
@@ -211,6 +211,23 @@ app.get('/hotels/:id/scans', async (req, res) => {
     } catch (err) {
           res.status(500).json({ error: 'Failed to fetch scans', message: err.message });
     }
+});
+
+app.get('/hotels/:id/discovery', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const listings = await pool.query(
+      'SELECT id, platform, url, confidence, verified, status, first_seen_at, last_seen_at FROM discovered_listings WHERE hotel_id = $1 ORDER BY id DESC LIMIT 100',
+      [req.params.id]
+    );
+    const comps = await pool.query(
+      'SELECT id, name, website, city, platform_source, confidence, distance_km, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 ORDER BY id DESC LIMIT 100',
+      [req.params.id]
+    );
+    res.json({ discoveredListings: listings.rows, competitors: comps.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch discovery data', message: err.message });
+  }
 });
 
 app.listen(port, () => {
