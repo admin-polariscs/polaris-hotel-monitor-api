@@ -32,22 +32,6 @@ app.get('/health', (req, res) => {
     });
 });
 
-app.get('/debug/db', async (req, res) => {
-    if (req.query.token !== process.env.DEBUG_TOKEN) {
-          return res.status(403).json({ error: 'Forbidden' });
-    }
-    try {
-          const { Client } = await import('pg');
-          const client = new Client({ connectionString: process.env.DATABASE_URL });
-          await client.connect();
-          const result = await client.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name");
-          await client.end();
-          res.json({ database: 'connected', tables: result.rows.map(r => r.table_name) });
-    } catch (error) {
-          res.status(500).json({ database: 'error', message: error.message });
-    }
-});
-
 // Build one scan_results row per dashboard module/section from the intelligence result.
 // This mirrors what the dashboard already shows - it does not add any new verification.
 function buildSections(result) {
@@ -227,26 +211,6 @@ app.get('/hotels/:id/scans', async (req, res) => {
     } catch (err) {
           res.status(500).json({ error: 'Failed to fetch scans', message: err.message });
     }
-});
-
-app.get('/debug/data', async (req, res) => {
-      if (req.query.token !== process.env.DEBUG_TOKEN) {
-              return res.status(403).json({ error: 'Forbidden' });
-      }
-      if (!pool) return res.status(503).json({ error: 'Database not configured' });
-      try {
-              const counts = {};
-              for (const table of ['hotels', 'scans', 'scan_results', 'discovered_listings', 'competitors']) {
-                        const c = await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
-                        counts[table] = c.rows[0].count;
-              }
-              const scanResults = await pool.query('SELECT id, scan_id, section, score, summary FROM scan_results ORDER BY id DESC LIMIT 20');
-              const listings = await pool.query('SELECT id, hotel_id, platform, url, confidence, verified, status FROM discovered_listings ORDER BY id DESC LIMIT 20');
-              const comps = await pool.query('SELECT id, hotel_id, name, website, confidence FROM competitors ORDER BY id DESC LIMIT 20');
-              res.json({ counts, scanResults: scanResults.rows, discoveredListings: listings.rows, competitors: comps.rows });
-      } catch (error) {
-              res.status(500).json({ error: error.message });
-      }
 });
 
 app.listen(port, () => {
