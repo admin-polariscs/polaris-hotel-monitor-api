@@ -246,6 +246,31 @@ app.get('/hotels/:id/discovery', async (req, res) => {
 // GOOGLE_OAUTH_REDIRECT_URI) are read only from environment variables and are
 // never hardcoded or logged.
 
+function getGoogleRedirectUri() {
+  return process.env.GOOGLE_OAUTH_REDIRECT_URI || process.env.GOOGLE_REDIRECT_URI;
+}
+
+function googleEnvBooleans() {
+  const hasGoogleClientId = !!process.env.GOOGLE_CLIENT_ID;
+  const hasGoogleClientSecret = !!process.env.GOOGLE_CLIENT_SECRET;
+  const hasGoogleOauthRedirectUri = !!process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  const hasGoogleRedirectUri = !!process.env.GOOGLE_REDIRECT_URI;
+  const redirectUriSelected = hasGoogleOauthRedirectUri
+    ? 'GOOGLE_OAUTH_REDIRECT_URI'
+    : (hasGoogleRedirectUri ? 'GOOGLE_REDIRECT_URI' : null);
+  return { hasGoogleClientId, hasGoogleClientSecret, hasGoogleOauthRedirectUri, hasGoogleRedirectUri, redirectUriSelected };
+}
+
+// Temporary, staging-only diagnostic endpoint. Protected by DEBUG_TOKEN.
+// Never returns actual secret values, only booleans. Remove before merging to main.
+app.get('/debug/google-env', (req, res) => {
+  const debugToken = process.env.DEBUG_TOKEN;
+  if (!debugToken || req.query.token !== debugToken) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  res.json(googleEnvBooleans());
+});
+
 async function refreshGoogleAccessToken(connection) {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -286,11 +311,11 @@ async function getValidGoogleAccessToken(connection) {
 
 app.get('/connect/google', (req, res) => {
   const clientId = process.env.GOOGLE_CLIENT_ID;
-  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  const redirectUri = getGoogleRedirectUri();
   if (!clientId || !redirectUri) {
     return res.status(503).json({
       error: 'Google connector not configured',
-      message: 'Set GOOGLE_CLIENT_ID and GOOGLE_OAUTH_REDIRECT_URI in the environment first.'
+      message: 'Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI or GOOGLE_REDIRECT_URI.'
     });
   }
   let state = '';
@@ -318,9 +343,9 @@ app.get('/oauth/google/callback', async (req, res) => {
 
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  const redirectUri = getGoogleRedirectUri();
   if (!clientId || !clientSecret || !redirectUri) {
-    return res.status(503).json({ error: 'Google connector not configured' });
+    return res.status(503).json({ error: 'Google connector not configured', message: 'Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI or GOOGLE_REDIRECT_URI.' });
   }
 
   let hotelId = null;
@@ -515,6 +540,8 @@ app.get('/hotels/:id/reviews', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch reviews', message: err.message });
   }
 });
+
+console.log('Google connector environment check:', JSON.stringify(googleEnvBooleans()));
 
 app.listen(port, () => {
     console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
