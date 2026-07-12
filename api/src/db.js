@@ -3,6 +3,9 @@
 // Reads connection info ONLY from the DATABASE_URL environment variable. Never hardcode credentials here.
 // All queries in this file are additive (INSERT/UPDATE/SELECT) - no DROP or destructive statements.
 import pg from 'pg';
+import { readdirSync, readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import path from 'path';
 
 const { Pool } = pg;
 const connectionString = process.env.DATABASE_URL;
@@ -102,4 +105,51 @@ export async function storeCompetitor({ hotelId, name, website, city, platformSo
                   rawData === undefined ? null : JSON.stringify(rawData)
                 ]
         );
+}
+
+// Applies any not-yet-applied migrations from ./migrations, in filename order, exactly once,
+// tracked via the migrations table. Idempotent and additive-only (same guarantee as
+// migrate.js) - safe to call on every server boot. Never runs DROP/destructive statements;
+// migration files themselves are reviewed separately and must stay additive-only.
+// This exists because the Render free-tier build step only runs `npm install` (no shell
+// access on free tier to run `npm run migrate` manually), so pending migrations are applied
+// automatically and safely at startup instead.
+export async function runPendingMigrations() {
+  if (!pool) {
+    console.log('Skipping migrations: DATABASE_URL not configured.');
+    return;
+  }
+  try {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    const migrationsDir = path.join(__dirname, 'migrations');
+
+    await pool.query('CREATE TABLE IF NOT EXISTS migrations (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, applied_at TIMESTAMPTZ DEFAULT now());');
+
+    const files = readdirSync(migrationsDir).filter((f) => f.endsWith('.sql')).sort();
+
+    for (const file of files) {
+      const { rows } = await pool.query('SELECT 1 FROM migrations WHERE name = $1', [file]);
+      if (rows.length > 0) continue;
+
+      console.log(`Applying migration: ${file}`);
+      const sql = readFileSync(path.join(migrationsDir, file), 'utf8');
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query('INSERT INTO migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING', [file]);
+        await client.query('COMMIT');
+        console.log(`Applied migration: ${file}`);
+      } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`Failed to apply migration ${file}:`, err.message);
+      } finally {
+        client.release();
+      }
+    }
+  } catch (err) {
+    console.error('Migration check failed:', err.message);
+  }
 }
