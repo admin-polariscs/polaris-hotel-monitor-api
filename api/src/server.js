@@ -444,6 +444,7 @@ async function fetchGoogleWithBackoff(url, options, maxAttempts) {
     if (r.ok) return { ok: true, status: r.status, data };
     lastData = data;
     lastStatus = r.status;
+console.error('TEMP_DEBUG_GOOGLE_ERROR', JSON.stringify({ status: r.status, data }));
 if (isGoogleApiAccessPendingError(r.status, data)) {
 return { ok: false, status: r.status, data, quota: false, accessPending: true };
 }
