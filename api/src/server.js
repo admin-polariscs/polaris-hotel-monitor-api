@@ -395,6 +395,7 @@ app.get('/oauth/google/callback', async (req, res) => {
 
 const GOOGLE_LOCATIONS_CACHE_TTL_MS = 15 * 60 * 1000;
 const GOOGLE_QUOTA_MESSAGE = 'Google Business Profile quota temporarily reached. Please try again in a few minutes.';
+const GOOGLE_QUOTA_CACHE_WARNING = 'Google quota temporarily reached. Showing last synced locations.';
 
 function isGoogleQuotaError(status, data) {
   if (status === 429) return true;
@@ -430,130 +431,148 @@ async function fetchGoogleWithBackoff(url, options, maxAttempts) {
   return { ok: false, status: lastStatus, data: lastData, quota: isGoogleQuotaError(lastStatus, lastData) };
 }
 
+async function fetchGoogleLocationsForConnection(connection, hotelId) {
+  const accessToken = await getValidGoogleAccessToken(connection);
+  if (!accessToken) {
+    return { ok: false, tokenError: true };
+  }
+
+  const accountsResult = await fetchGoogleWithBackoff('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
+  if (!accountsResult.ok) {
+    return { ok: false, quota: accountsResult.quota, data: accountsResult.data };
+  }
+
+  const accounts = (accountsResult.data && accountsResult.data.accounts) || [];
+  const results = [];
+  let hotelDomain = null;
+  if (hotelId) {
+    const hotelRes = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+    hotelDomain = hotelRes.rows.length ? hotelRes.rows[0].domain : null;
+  }
+
+  let hitQuotaMidway = false;
+
+  for (const account of accounts) {
+    const locResult = await fetchGoogleWithBackoff(
+      `https://mybusinessbusinessinformation.googleapis.com/v1/${account.name}/locations?readMask=name,title,storefrontAddress,phoneNumbers,websiteUri`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    if (!locResult.ok) {
+      if (locResult.quota) {
+        hitQuotaMidway = true;
+        results.push({ account: account.name, accountName: account.accountName, error: GOOGLE_QUOTA_MESSAGE });
+        continue;
+      }
+      results.push({
+        account: account.name,
+        accountName: account.accountName,
+        error: (locResult.data && locResult.data.error && locResult.data.error.message) || 'Failed to list locations'
+      });
+      continue;
+    }
+
+    const locData = locResult.data || {};
+    const locations = (locData.locations || []).map((loc) => {
+      const addr = loc.storefrontAddress;
+      const address = addr
+        ? [addr.addressLines ? addr.addressLines.join(', ') : null, addr.locality, addr.administrativeArea, addr.postalCode, addr.regionCode]
+            .filter(Boolean)
+            .join(', ')
+        : null;
+      return {
+        locationId: loc.name,
+        name: account.accountName,
+        title: loc.title,
+        address,
+        phone: (loc.phoneNumbers && loc.phoneNumbers.primaryPhone) || null,
+        website: loc.websiteUri || null
+      };
+    });
+
+    if (hotelId && hotelDomain) {
+      const match = locations.find((loc) => loc.website && normaliseDomain(loc.website) === hotelDomain);
+      if (match) {
+        await pool.query(
+          `UPDATE google_connections
+           SET location_id = $1, location_name = $2, google_account_id = $3, google_account_name = $4,
+               status = 'matched', updated_at = now()
+           WHERE id = $5`,
+          [match.locationId, match.title || match.name, account.name, account.accountName, connection.id]
+        );
+      }
+    }
+
+    results.push({ account: account.name, accountName: account.accountName, locations });
+  }
+
+  await pool.query(
+    'UPDATE google_connections SET locations_cache = $1, locations_fetched_at = now(), updated_at = now() WHERE id = $2',
+    [JSON.stringify(results), connection.id]
+  );
+
+  return { ok: true, results, hitQuotaMidway };
+}
+
+async function loadGoogleConnection(hotelId) {
+  const connResult = hotelId
+    ? await pool.query('SELECT * FROM google_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1', [hotelId])
+    : await pool.query('SELECT * FROM google_connections ORDER BY id DESC LIMIT 1');
+  return connResult.rows.length ? connResult.rows[0] : null;
+}
+
 app.get('/google/locations', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' });
   try {
     const hotelId = req.query.hotelId || null;
-    const connResult = hotelId
-      ? await pool.query('SELECT * FROM google_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1', [hotelId])
-      : await pool.query('SELECT * FROM google_connections ORDER BY id DESC LIMIT 1');
+    const connection = await loadGoogleConnection(hotelId);
 
-    if (!connResult.rows.length) {
+    if (!connection) {
       return res.status(404).json({
         error: 'No Google connection found',
         message: 'Connect a Google account first via /connect/google'
       });
     }
 
-    const connection = connResult.rows[0];
-
     if (connection.locations_cache && connection.locations_fetched_at) {
       const ageMs = Date.now() - new Date(connection.locations_fetched_at).getTime();
       if (ageMs < GOOGLE_LOCATIONS_CACHE_TTL_MS) {
         return res.json({
           accounts: connection.locations_cache,
+          source: 'cache',
           cache: { hit: true, fetchedAt: connection.locations_fetched_at, ageSeconds: Math.round(ageMs / 1000) }
         });
       }
     }
 
-    const accessToken = await getValidGoogleAccessToken(connection);
-    if (!accessToken) {
-      return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
-    }
+    const fetchResult = await fetchGoogleLocationsForConnection(connection, hotelId);
 
-    const accountsResult = await fetchGoogleWithBackoff('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
-
-    if (!accountsResult.ok) {
-      if (accountsResult.quota) {
+    if (!fetchResult.ok) {
+      if (fetchResult.tokenError) {
+        return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
+      }
+      if (fetchResult.quota) {
         if (connection.locations_cache) {
           return res.json({
             accounts: connection.locations_cache,
+            source: 'cache',
             cache: { hit: true, stale: true, fetchedAt: connection.locations_fetched_at },
-            warning: GOOGLE_QUOTA_MESSAGE
+            warning: GOOGLE_QUOTA_CACHE_WARNING
           });
         }
         return res.status(429).json({ error: GOOGLE_QUOTA_MESSAGE });
       }
       return res.status(502).json({
         error: 'Failed to list Google Business accounts',
-        message: (accountsResult.data && accountsResult.data.error && accountsResult.data.error.message) || 'Unknown error'
+        message: (fetchResult.data && fetchResult.data.error && fetchResult.data.error.message) || 'Unknown error'
       });
     }
 
-    const accounts = (accountsResult.data && accountsResult.data.accounts) || [];
-    const results = [];
-    let hotelDomain = null;
-    if (hotelId) {
-      const hotelRes = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
-      hotelDomain = hotelRes.rows.length ? hotelRes.rows[0].domain : null;
-    }
-
-    let hitQuotaMidway = false;
-
-    for (const account of accounts) {
-      const locResult = await fetchGoogleWithBackoff(
-        `https://mybusinessbusinessinformation.googleapis.com/v1/${account.name}/locations?readMask=name,title,storefrontAddress,phoneNumbers,websiteUri`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-
-      if (!locResult.ok) {
-        if (locResult.quota) {
-          hitQuotaMidway = true;
-          results.push({ account: account.name, accountName: account.accountName, error: GOOGLE_QUOTA_MESSAGE });
-          continue;
-        }
-        results.push({
-          account: account.name,
-          accountName: account.accountName,
-          error: (locResult.data && locResult.data.error && locResult.data.error.message) || 'Failed to list locations'
-        });
-        continue;
-      }
-
-      const locData = locResult.data || {};
-      const locations = (locData.locations || []).map((loc) => {
-        const addr = loc.storefrontAddress;
-        const address = addr
-          ? [addr.addressLines ? addr.addressLines.join(', ') : null, addr.locality, addr.administrativeArea, addr.postalCode, addr.regionCode]
-              .filter(Boolean)
-              .join(', ')
-          : null;
-        return {
-          locationId: loc.name,
-          name: account.accountName,
-          title: loc.title,
-          address,
-          phone: (loc.phoneNumbers && loc.phoneNumbers.primaryPhone) || null,
-          website: loc.websiteUri || null
-        };
-      });
-
-      if (hotelId && hotelDomain) {
-        const match = locations.find((loc) => loc.website && normaliseDomain(loc.website) === hotelDomain);
-        if (match) {
-          await pool.query(
-            `UPDATE google_connections
-             SET location_id = $1, location_name = $2, google_account_id = $3, google_account_name = $4,
-                 status = 'matched', updated_at = now()
-             WHERE id = $5`,
-            [match.locationId, match.title || match.name, account.name, account.accountName, connection.id]
-          );
-        }
-      }
-
-      results.push({ account: account.name, accountName: account.accountName, locations });
-    }
-
-    await pool.query(
-      'UPDATE google_connections SET locations_cache = $1, locations_fetched_at = now(), updated_at = now() WHERE id = $2',
-      [JSON.stringify(results), connection.id]
-    );
-
-    const response = { accounts: results };
-    if (hitQuotaMidway) {
+    const response = { accounts: fetchResult.results, source: 'live' };
+    if (fetchResult.hitQuotaMidway) {
       response.warning = GOOGLE_QUOTA_MESSAGE;
     }
     res.json(response);
@@ -563,6 +582,52 @@ app.get('/google/locations', async (req, res) => {
   }
 });
 
+app.post('/google/sync-locations', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const hotelId = (req.body && req.body.hotelId) || req.query.hotelId || null;
+    const connection = await loadGoogleConnection(hotelId);
+
+    if (!connection) {
+      return res.status(404).json({
+        error: 'No Google connection found',
+        message: 'Connect a Google account first via /connect/google'
+      });
+    }
+
+    const fetchResult = await fetchGoogleLocationsForConnection(connection, hotelId);
+
+    if (!fetchResult.ok) {
+      if (fetchResult.tokenError) {
+        return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
+      }
+      if (fetchResult.quota) {
+        if (connection.locations_cache) {
+          return res.json({
+            accounts: connection.locations_cache,
+            source: 'cache',
+            cache: { hit: true, stale: true, fetchedAt: connection.locations_fetched_at },
+            warning: GOOGLE_QUOTA_CACHE_WARNING
+          });
+        }
+        return res.status(429).json({ error: GOOGLE_QUOTA_MESSAGE });
+      }
+      return res.status(502).json({
+        error: 'Failed to list Google Business accounts',
+        message: (fetchResult.data && fetchResult.data.error && fetchResult.data.error.message) || 'Unknown error'
+      });
+    }
+
+    const response = { accounts: fetchResult.results, source: 'live', synced: true };
+    if (fetchResult.hitQuotaMidway) {
+      response.warning = GOOGLE_QUOTA_MESSAGE;
+    }
+    res.json(response);
+  } catch (err) {
+    console.error('Failed to sync Google locations:', err.message);
+    res.status(500).json({ error: 'Failed to sync Google locations', message: err.message });
+  }
+});
 app.get('/hotels/:id/reviews', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' });
   try {
