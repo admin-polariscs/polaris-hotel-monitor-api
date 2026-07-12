@@ -396,6 +396,30 @@ app.get('/oauth/google/callback', async (req, res) => {
 const GOOGLE_LOCATIONS_CACHE_TTL_MS = 15 * 60 * 1000;
 const GOOGLE_QUOTA_MESSAGE = 'Google Business Profile quota temporarily reached. Please try again in a few minutes.';
 const GOOGLE_QUOTA_CACHE_WARNING = 'Google quota temporarily reached. Showing last synced locations.';
+const GOOGLE_API_ACCESS_PENDING_STATUS = 'api_access_pending';
+const GOOGLE_API_ACCESS_PENDING_TITLE = 'Google Business Profile API access pending';
+const GOOGLE_API_ACCESS_PENDING_MESSAGE = 'Google OAuth is connected, but this Google Cloud project is still waiting for Google Business Profile API approval. Once Google approves the access request, Polaris will be able to sync locations and reviews.';
+
+function isGoogleApiAccessPendingError(status, data) {
+const errObj = (data && data.error) || {};
+const reasonStatus = (errObj.status || '').toUpperCase();
+const message = (errObj.message || '').toLowerCase();
+if (reasonStatus === 'PERMISSION_DENIED') return true;
+const details = Array.isArray(errObj.details) ? errObj.details : [];
+for (const d of details) {
+if (d && Array.isArray(d.violations)) {
+for (const v of d.violations) {
+if (v && (v.quotaValue === '0' || v.quotaValue === 0)) return true;
+}
+}
+if (d && typeof d.reason === 'string' && d.reason.toUpperCase() === 'SERVICE_DISABLED') return true;
+}
+if (message.indexOf('has not been used') !== -1) return true;
+if (message.indexOf('is disabled') !== -1) return true;
+if (message.indexOf('not enabled') !== -1) return true;
+if (message.indexOf('does not have permission') !== -1) return true;
+return false;
+}
 
 function isGoogleQuotaError(status, data) {
   if (status === 429) return true;
@@ -420,7 +444,10 @@ async function fetchGoogleWithBackoff(url, options, maxAttempts) {
     if (r.ok) return { ok: true, status: r.status, data };
     lastData = data;
     lastStatus = r.status;
-    if (isGoogleQuotaError(r.status, data) && attempt < attempts - 1) {
+if (isGoogleApiAccessPendingError(r.status, data)) {
+return { ok: false, status: r.status, data, quota: false, accessPending: true };
+}
+if (isGoogleQuotaError(r.status, data) && attempt < attempts - 1) {
       const delayMs = 500 * Math.pow(2, attempt);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
       attempt += 1;
@@ -442,8 +469,8 @@ async function fetchGoogleLocationsForConnection(connection, hotelId) {
   });
 
   if (!accountsResult.ok) {
-    return { ok: false, quota: accountsResult.quota, data: accountsResult.data };
-  }
+return { ok: false, quota: accountsResult.quota, accessPending: accountsResult.accessPending, data: accountsResult.data };
+}
 
   const accounts = (accountsResult.data && accountsResult.data.accounts) || [];
   const results = [];
@@ -454,6 +481,7 @@ async function fetchGoogleLocationsForConnection(connection, hotelId) {
   }
 
   let hitQuotaMidway = false;
+let hitAccessPendingMidway = false;
 
   for (const account of accounts) {
     const locResult = await fetchGoogleWithBackoff(
@@ -462,11 +490,16 @@ async function fetchGoogleLocationsForConnection(connection, hotelId) {
     );
 
     if (!locResult.ok) {
-      if (locResult.quota) {
-        hitQuotaMidway = true;
-        results.push({ account: account.name, accountName: account.accountName, error: GOOGLE_QUOTA_MESSAGE });
-        continue;
-      }
+if (locResult.accessPending) {
+hitAccessPendingMidway = true;
+results.push({ account: account.name, accountName: account.accountName, error: GOOGLE_API_ACCESS_PENDING_MESSAGE });
+continue;
+}
+if (locResult.quota) {
+hitQuotaMidway = true;
+results.push({ account: account.name, accountName: account.accountName, error: GOOGLE_QUOTA_MESSAGE });
+continue;
+}
       results.push({
         account: account.name,
         accountName: account.accountName,
@@ -514,7 +547,7 @@ async function fetchGoogleLocationsForConnection(connection, hotelId) {
     [JSON.stringify(results), connection.id]
   );
 
-  return { ok: true, results, hitQuotaMidway };
+  return { ok: true, results, hitQuotaMidway, hitAccessPendingMidway };
 }
 
 async function loadGoogleConnection(hotelId) {
@@ -552,9 +585,18 @@ app.get('/google/locations', async (req, res) => {
 
     if (!fetchResult.ok) {
       if (fetchResult.tokenError) {
-        return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
-      }
-      if (fetchResult.quota) {
+return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
+}
+if (fetchResult.accessPending) {
+return res.json({
+status: GOOGLE_API_ACCESS_PENDING_STATUS,
+title: GOOGLE_API_ACCESS_PENDING_TITLE,
+message: GOOGLE_API_ACCESS_PENDING_MESSAGE,
+accounts: connection.locations_cache || [],
+source: connection.locations_cache ? 'cache' : 'none'
+});
+}
+if (fetchResult.quota) {
         if (connection.locations_cache) {
           return res.json({
             accounts: connection.locations_cache,
@@ -572,10 +614,14 @@ app.get('/google/locations', async (req, res) => {
     }
 
     const response = { accounts: fetchResult.results, source: 'live' };
-    if (fetchResult.hitQuotaMidway) {
-      response.warning = GOOGLE_QUOTA_MESSAGE;
-    }
-    res.json(response);
+if (fetchResult.hitAccessPendingMidway) {
+response.status = GOOGLE_API_ACCESS_PENDING_STATUS;
+response.title = GOOGLE_API_ACCESS_PENDING_TITLE;
+response.warning = GOOGLE_API_ACCESS_PENDING_MESSAGE;
+} else if (fetchResult.hitQuotaMidway) {
+response.warning = GOOGLE_QUOTA_MESSAGE;
+}
+res.json(response);
   } catch (err) {
     console.error('Failed to list Google locations:', err.message);
     res.status(500).json({ error: 'Failed to list Google locations', message: err.message });
@@ -599,9 +645,18 @@ app.post('/google/sync-locations', async (req, res) => {
 
     if (!fetchResult.ok) {
       if (fetchResult.tokenError) {
-        return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
-      }
-      if (fetchResult.quota) {
+return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
+}
+if (fetchResult.accessPending) {
+return res.json({
+status: GOOGLE_API_ACCESS_PENDING_STATUS,
+title: GOOGLE_API_ACCESS_PENDING_TITLE,
+message: GOOGLE_API_ACCESS_PENDING_MESSAGE,
+accounts: connection.locations_cache || [],
+source: connection.locations_cache ? 'cache' : 'none'
+});
+}
+if (fetchResult.quota) {
         if (connection.locations_cache) {
           return res.json({
             accounts: connection.locations_cache,
@@ -619,10 +674,14 @@ app.post('/google/sync-locations', async (req, res) => {
     }
 
     const response = { accounts: fetchResult.results, source: 'live', synced: true };
-    if (fetchResult.hitQuotaMidway) {
-      response.warning = GOOGLE_QUOTA_MESSAGE;
-    }
-    res.json(response);
+if (fetchResult.hitAccessPendingMidway) {
+response.status = GOOGLE_API_ACCESS_PENDING_STATUS;
+response.title = GOOGLE_API_ACCESS_PENDING_TITLE;
+response.warning = GOOGLE_API_ACCESS_PENDING_MESSAGE;
+} else if (fetchResult.hitQuotaMidway) {
+response.warning = GOOGLE_QUOTA_MESSAGE;
+}
+res.json(response);
   } catch (err) {
     console.error('Failed to sync Google locations:', err.message);
     res.status(500).json({ error: 'Failed to sync Google locations', message: err.message });
