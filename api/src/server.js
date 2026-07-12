@@ -407,6 +407,7 @@ const message = (errObj.message || '').toLowerCase();
 if (reasonStatus === 'PERMISSION_DENIED') return true;
 const details = Array.isArray(errObj.details) ? errObj.details : [];
 for (const d of details) {
+if (d && d.metadata && (d.metadata.quota_limit_value === '0' || d.metadata.quota_limit_value === 0)) return true;
 if (d && Array.isArray(d.violations)) {
 for (const v of d.violations) {
 if (v && (v.quotaValue === '0' || v.quotaValue === 0)) return true;
@@ -444,7 +445,6 @@ async function fetchGoogleWithBackoff(url, options, maxAttempts) {
     if (r.ok) return { ok: true, status: r.status, data };
     lastData = data;
     lastStatus = r.status;
-console.error('TEMP_DEBUG_GOOGLE_ERROR', JSON.stringify({ status: r.status, data }));
 if (isGoogleApiAccessPendingError(r.status, data)) {
 return { ok: false, status: r.status, data, quota: false, accessPending: true };
 }
