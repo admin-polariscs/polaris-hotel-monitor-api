@@ -393,6 +393,43 @@ app.get('/oauth/google/callback', async (req, res) => {
   }
 });
 
+const GOOGLE_LOCATIONS_CACHE_TTL_MS = 15 * 60 * 1000;
+const GOOGLE_QUOTA_MESSAGE = 'Google Business Profile quota temporarily reached. Please try again in a few minutes.';
+
+function isGoogleQuotaError(status, data) {
+  if (status === 429) return true;
+  const reason = (data && data.error && data.error.status) || '';
+  const message = (data && data.error && data.error.message ? data.error.message : '').toLowerCase();
+  return reason === 'RESOURCE_EXHAUSTED' || message.indexOf('quota') !== -1 || message.indexOf('rate limit') !== -1;
+}
+
+async function fetchGoogleWithBackoff(url, options, maxAttempts) {
+  const attempts = maxAttempts || 4;
+  let attempt = 0;
+  let lastData = null;
+  let lastStatus = null;
+  while (attempt < attempts) {
+    const r = await fetch(url, options);
+    let data;
+    try {
+      data = await r.json();
+    } catch (e) {
+      data = null;
+    }
+    if (r.ok) return { ok: true, status: r.status, data };
+    lastData = data;
+    lastStatus = r.status;
+    if (isGoogleQuotaError(r.status, data) && attempt < attempts - 1) {
+      const delayMs = 500 * Math.pow(2, attempt);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      attempt += 1;
+      continue;
+    }
+    return { ok: false, status: lastStatus, data: lastData, quota: isGoogleQuotaError(lastStatus, lastData) };
+  }
+  return { ok: false, status: lastStatus, data: lastData, quota: isGoogleQuotaError(lastStatus, lastData) };
+}
+
 app.get('/google/locations', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' });
   try {
@@ -409,23 +446,44 @@ app.get('/google/locations', async (req, res) => {
     }
 
     const connection = connResult.rows[0];
+
+    if (connection.locations_cache && connection.locations_fetched_at) {
+      const ageMs = Date.now() - new Date(connection.locations_fetched_at).getTime();
+      if (ageMs < GOOGLE_LOCATIONS_CACHE_TTL_MS) {
+        return res.json({
+          accounts: connection.locations_cache,
+          cache: { hit: true, fetchedAt: connection.locations_fetched_at, ageSeconds: Math.round(ageMs / 1000) }
+        });
+      }
+    }
+
     const accessToken = await getValidGoogleAccessToken(connection);
     if (!accessToken) {
       return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
     }
 
-    const accountsRes = await fetch('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
+    const accountsResult = await fetchGoogleWithBackoff('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
-    const accountsData = await accountsRes.json();
-    if (!accountsRes.ok) {
+
+    if (!accountsResult.ok) {
+      if (accountsResult.quota) {
+        if (connection.locations_cache) {
+          return res.json({
+            accounts: connection.locations_cache,
+            cache: { hit: true, stale: true, fetchedAt: connection.locations_fetched_at },
+            warning: GOOGLE_QUOTA_MESSAGE
+          });
+        }
+        return res.status(429).json({ error: GOOGLE_QUOTA_MESSAGE });
+      }
       return res.status(502).json({
         error: 'Failed to list Google Business accounts',
-        message: (accountsData.error && accountsData.error.message) || 'Unknown error'
+        message: (accountsResult.data && accountsResult.data.error && accountsResult.data.error.message) || 'Unknown error'
       });
     }
 
-    const accounts = accountsData.accounts || [];
+    const accounts = (accountsResult.data && accountsResult.data.accounts) || [];
     const results = [];
     let hotelDomain = null;
     if (hotelId) {
@@ -433,21 +491,29 @@ app.get('/google/locations', async (req, res) => {
       hotelDomain = hotelRes.rows.length ? hotelRes.rows[0].domain : null;
     }
 
+    let hitQuotaMidway = false;
+
     for (const account of accounts) {
-      const locRes = await fetch(
+      const locResult = await fetchGoogleWithBackoff(
         `https://mybusinessbusinessinformation.googleapis.com/v1/${account.name}/locations?readMask=name,title,storefrontAddress,phoneNumbers,websiteUri`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
-      const locData = await locRes.json();
-      if (!locRes.ok) {
+
+      if (!locResult.ok) {
+        if (locResult.quota) {
+          hitQuotaMidway = true;
+          results.push({ account: account.name, accountName: account.accountName, error: GOOGLE_QUOTA_MESSAGE });
+          continue;
+        }
         results.push({
           account: account.name,
           accountName: account.accountName,
-          error: (locData.error && locData.error.message) || 'Failed to list locations'
+          error: (locResult.data && locResult.data.error && locResult.data.error.message) || 'Failed to list locations'
         });
         continue;
       }
 
+      const locData = locResult.data || {};
       const locations = (locData.locations || []).map((loc) => {
         const addr = loc.storefrontAddress;
         const address = addr
@@ -481,7 +547,16 @@ app.get('/google/locations', async (req, res) => {
       results.push({ account: account.name, accountName: account.accountName, locations });
     }
 
-    res.json({ accounts: results });
+    await pool.query(
+      'UPDATE google_connections SET locations_cache = $1, locations_fetched_at = now(), updated_at = now() WHERE id = $2',
+      [JSON.stringify(results), connection.id]
+    );
+
+    const response = { accounts: results };
+    if (hitQuotaMidway) {
+      response.warning = GOOGLE_QUOTA_MESSAGE;
+    }
+    res.json(response);
   } catch (err) {
     console.error('Failed to list Google locations:', err.message);
     res.status(500).json({ error: 'Failed to list Google locations', message: err.message });
