@@ -11,7 +11,8 @@ import {
     failScan,
     storeScanResult,
     storeDiscoveredListing,
-    storeCompetitor
+    storeCompetitor,
+  runPendingMigrations
 } from './db.js';
 
 const app = express();
@@ -968,6 +969,12 @@ app.get('/hotels/:id/reviews', async (req, res) => {
 });
 
 console.log('Google connector environment check:', JSON.stringify(googleEnvBooleans()));
+
+// Apply any pending, additive-only database migrations before accepting traffic.
+// Safe on every boot (idempotent, tracked via the migrations table).
+if (pool) {
+  await runPendingMigrations();
+}
 
 app.listen(port, () => {
     console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
