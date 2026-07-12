@@ -18,6 +18,8 @@ export const TRIPADVISOR_STATUS = {
 export const TRIPADVISOR_NOT_CONFIGURED_MESSAGE = 'Tripadvisor connector not configured yet.';
 export const TRIPADVISOR_LIMITED_DATA_MESSAGE = 'Tripadvisor data is available as a limited reputation signal.';
 export const TRIPADVISOR_CUSTOMER_WORDING = 'Tripadvisor Reputation Signal uses limited recent review data available through the official API.';
+export const TRIPADVISOR_LIMITED_HISTORY_WORDING = 'Limited recent reviews are not a complete review history.';
+export const TRIPADVISOR_EARLY_WARNING_WORDING = 'Use this as an early-warning signal, not as a full review analytics source.';
 
 export function getTripadvisorApiKey() {
   return process.env.TRIPADVISOR_API_KEY || null;
@@ -59,16 +61,72 @@ async function tripadvisorFetch(path, params) {
   }
 }
 
-// Official Location Search - finds the Tripadvisor location_id for a hotel by name/address.
+// --- Conservative candidate matching helpers (no external calls; pure string comparison) -------
+function normaliseForMatch(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function nameSimilarityScore(a, b) {
+  const na = normaliseForMatch(a);
+  const nb = normaliseForMatch(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  if (na.includes(nb) || nb.includes(na)) return 0.8;
+  const ta = new Set(na.split(' '));
+  const tb = new Set(nb.split(' '));
+  let overlap = 0;
+  ta.forEach((t) => { if (tb.has(t)) overlap += 1; });
+  const denom = Math.max(ta.size, tb.size) || 1;
+  return overlap / denom;
+}
+
+// Picks the best Location Search candidate conservatively using name + city (and address/phone
+// when the API echoes them back). Never assumes a match - always returns a bounded confidence.
+function pickBestTripadvisorCandidate(candidates, entity) {
+  let best = null;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const nameScore = nameSimilarityScore(entity.name, candidate.name);
+    const candidateCity = candidate.address_obj && (candidate.address_obj.city || candidate.address_obj.state);
+    let cityScore = 0.5; // neutral when there is nothing to compare
+    if (entity.city && candidateCity) {
+      cityScore = normaliseForMatch(entity.city) === normaliseForMatch(candidateCity) ? 1 : 0;
+    }
+    const score = (nameScore * 0.7) + (cityScore * 0.3);
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return { candidate: best, score: Math.max(bestScore, 0) };
+}
+
+// Conservative confidence mapping: never auto-reports full certainty (capped at 90) and only
+// treats a match as "verified" when both name and city evidence are strong.
+function tripadvisorCandidateConfidence(score) {
+  const confidence = Math.round(30 + score * 60);
+  return Math.max(0, Math.min(90, confidence));
+}
+
+// Official Location Search - finds Tripadvisor location candidates by name/city/address/phone.
 // Does not scrape search results pages; uses the documented Content API search endpoint only.
+// Tripadvisor's Location Search returns up to ~10 candidates; we pick the best one conservatively
+// and never assume the top result is correct without a name/city comparison.
 async function searchTripadvisorLocation(entity) {
-  const query = [entity.name, entity.city || ''].filter(Boolean).join(' ');
+  const query = [entity.name, entity.city || '', entity.address || ''].filter(Boolean).join(' ').trim();
   if (!query) return { ok: false, reason: 'no_query' };
-  const result = await tripadvisorFetch('/location/search', { searchQuery: query, category: 'hotels' });
+  const params = { searchQuery: query, category: 'hotels' };
+  if (entity.phone) params.phone = entity.phone;
+  if (entity.address) params.address = entity.address;
+  const result = await tripadvisorFetch('/location/search', params);
   if (!result.ok) return result;
   const candidates = (result.data && result.data.data) || [];
   if (!candidates.length) return { ok: false, reason: 'no_match' };
-  return { ok: true, locationId: candidates[0].location_id, candidate: candidates[0] };
+  const { candidate, score } = pickBestTripadvisorCandidate(candidates, entity);
+  if (!candidate) return { ok: false, reason: 'no_match' };
+  const confidence = tripadvisorCandidateConfidence(score);
+  const verified = confidence >= 85;
+  return { ok: true, locationId: candidate.location_id, candidate, confidence, verified, matchScore: score };
 }
 
 // Official Location Details - rating, review_count, profile_url (web_url), photos_count.
@@ -91,11 +149,12 @@ async function getTripadvisorLocationReviews(locationId) {
 // --- Local rule-based review classification (default path, always available) -----------------
 const URGENT_TERMS = [
   'bed bug', 'bedbug', 'mold', 'mould', 'unsafe', 'assault', 'theft', 'stolen', 'fire alarm',
-  'food poisoning', 'infestation', 'sewage', 'no hot water', 'roach', 'cockroach', 'scam', 'fraud'
+  'food poisoning', 'infestation', 'sewage', 'no hot water', 'roach', 'cockroach', 'scam', 'fraud',
+  'dirty', 'rude', 'aggressive', 'disgusting', 'cancelled', 'overcharged', 'no refund', 'terrible service'
 ];
 const NEGATIVE_TERMS = [
   'dirty', 'rude', 'broken', 'terrible', 'awful', 'worst', 'disgusting', 'refund', 'unclean',
-  'noisy', 'smell', 'poor service', 'never again', 'disappointed', 'overpriced'
+  'noisy', 'noise', 'smell', 'poor service', 'never again', 'disappointed', 'overpriced'
 ];
 const POSITIVE_TERMS = [
   'amazing', 'wonderful', 'excellent', 'clean', 'friendly', 'great', 'lovely', 'perfect',
@@ -166,14 +225,48 @@ async function classifyReviews(reviews) {
 // Alert logic - purely derived from the classified, limited review set above.
 function buildAlerts(classifiedReviews) {
   const negative_review_detected = classifiedReviews.some((r) => r.classification === 'negative' || r.classification === 'urgent_negative');
-  const urgent_terms_detected = classifiedReviews.some((r) => r.classification === 'urgent_negative');
-  const recommended_response_needed = negative_review_detected || urgent_terms_detected;
-  return { negative_review_detected, urgent_terms_detected, recommended_response_needed };
+  const urgent_negative_detected = classifiedReviews.some((r) => r.classification === 'urgent_negative');
+  const recommended_response_needed = negative_review_detected || urgent_negative_detected;
+  return { negative_review_detected, urgent_negative_detected, recommended_response_needed };
 }
 
-// Full orchestration for GET /hotels/:id/tripadvisor. Never scrapes; only calls the official
-// Content API endpoints (search -> details -> reviews). Any failure at any stage degrades
-// gracefully to an honest status (unavailable/error) rather than fabricating data.
+// Simple aggregate counts across the limited recent review set - an early-warning signal only,
+// never presented as a full review analytics source.
+function buildSentimentSummary(classifiedReviews) {
+  const counts = { positive: 0, neutral: 0, negative: 0, urgent_negative: 0 };
+  classifiedReviews.forEach((r) => {
+    if (Object.prototype.hasOwnProperty.call(counts, r.classification)) counts[r.classification] += 1;
+  });
+  const total = classifiedReviews.length;
+  let overall = 'no_data';
+  if (total > 0) {
+    if (counts.urgent_negative > 0) overall = 'urgent_negative_present';
+    else if (counts.negative > counts.positive) overall = 'mostly_negative';
+    else if (counts.positive > counts.negative) overall = 'mostly_positive';
+    else overall = 'mixed';
+  }
+  return { ...counts, total, overall };
+}
+
+function buildRecommendedAction(alerts, sentimentSummary) {
+  if (alerts.urgent_negative_detected) {
+    return 'Urgent: respond to the recent urgent negative review(s) as a priority and check for the reported issue on-site.';
+  }
+  if (alerts.negative_review_detected) {
+    return 'Respond to recent negative feedback and monitor for recurring issues.';
+  }
+  if (sentimentSummary.total > 0) {
+    return 'No urgent issues detected in the limited recent reviews. Continue monitoring periodically.';
+  }
+  return 'No recent reviews were returned by the official API yet. Continue monitoring periodically.';
+}
+
+const EMPTY_ALERTS = { negative_review_detected: false, urgent_negative_detected: false, recommended_response_needed: false };
+const EMPTY_SENTIMENT_SUMMARY = { positive: 0, neutral: 0, negative: 0, urgent_negative: 0, total: 0, overall: 'no_data' };
+
+// Full orchestration for POST /hotels/:id/tripadvisor/sync. Never scrapes; only calls the
+// official Content API endpoints (search -> details -> reviews). Any failure at any stage
+// degrades gracefully to an honest status (unavailable/error) rather than fabricating data.
 export async function fetchTripadvisorData(entity) {
   const key = getTripadvisorApiKey();
   if (!key) {
@@ -186,8 +279,14 @@ export async function fetchTripadvisorData(entity) {
       rating: null,
       review_count: null,
       photos_count: null,
-      latest_reviews_limited: [],
-      alerts: { negative_review_detected: false, urgent_terms_detected: false, recommended_response_needed: false },
+      confidence: null,
+      verified: false,
+      limited_recent_reviews: [],
+      negative_review_detected: false,
+      urgent_negative_detected: false,
+      recommended_response_needed: false,
+      sentiment_summary: EMPTY_SENTIMENT_SUMMARY,
+      recommended_action: 'Add a Tripadvisor Content API key to enable this reputation signal.',
       raw_data: null,
       last_synced_at: new Date().toISOString()
     };
@@ -204,8 +303,14 @@ export async function fetchTripadvisorData(entity) {
       rating: null,
       review_count: null,
       photos_count: null,
-      latest_reviews_limited: [],
-      alerts: { negative_review_detected: false, urgent_terms_detected: false, recommended_response_needed: false },
+      confidence: null,
+      verified: false,
+      limited_recent_reviews: [],
+      negative_review_detected: false,
+      urgent_negative_detected: false,
+      recommended_response_needed: false,
+      sentiment_summary: EMPTY_SENTIMENT_SUMMARY,
+      recommended_action: 'No confident Tripadvisor match found yet; try syncing again once more hotel details are available.',
       raw_data: { searchError: searchResult.reason || null },
       last_synced_at: new Date().toISOString()
     };
@@ -225,8 +330,14 @@ export async function fetchTripadvisorData(entity) {
       rating: null,
       review_count: null,
       photos_count: null,
-      latest_reviews_limited: [],
-      alerts: { negative_review_detected: false, urgent_terms_detected: false, recommended_response_needed: false },
+      confidence: searchResult.confidence,
+      verified: searchResult.verified,
+      limited_recent_reviews: [],
+      negative_review_detected: false,
+      urgent_negative_detected: false,
+      recommended_response_needed: false,
+      sentiment_summary: EMPTY_SENTIMENT_SUMMARY,
+      recommended_action: 'Tripadvisor details unavailable right now; try syncing again later.',
       raw_data: { detailsError: detailsResult.reason || null },
       last_synced_at: new Date().toISOString()
     };
@@ -236,6 +347,8 @@ export async function fetchTripadvisorData(entity) {
   const reviews = reviewsResult.ok ? reviewsResult.reviews : [];
   const classifiedReviews = await classifyReviews(reviews);
   const alerts = buildAlerts(classifiedReviews);
+  const sentimentSummary = buildSentimentSummary(classifiedReviews);
+  const recommendedAction = buildRecommendedAction(alerts, sentimentSummary);
 
   return {
     status: TRIPADVISOR_STATUS.LIMITED_DATA_AVAILABLE,
@@ -246,8 +359,14 @@ export async function fetchTripadvisorData(entity) {
     rating: details.rating ? Number(details.rating) : null,
     review_count: details.num_reviews ? Number(details.num_reviews) : null,
     photos_count: details.photo_count ? Number(details.photo_count) : null,
-    latest_reviews_limited: classifiedReviews,
-    alerts,
+    confidence: searchResult.confidence,
+    verified: searchResult.verified,
+    limited_recent_reviews: classifiedReviews,
+    negative_review_detected: alerts.negative_review_detected,
+    urgent_negative_detected: alerts.urgent_negative_detected,
+    recommended_response_needed: alerts.recommended_response_needed,
+    sentiment_summary: sentimentSummary,
+    recommended_action: recommendedAction,
     raw_data: { details, reviewsAvailable: reviewsResult.ok, searchCandidate: searchResult.candidate || null },
     last_synced_at: new Date().toISOString()
   };
@@ -263,16 +382,20 @@ export function buildTripadvisorOtaEvidenceEntry(tripadvisorRow) {
     ? 'limited_data_available'
     : (tripadvisorRow.status === TRIPADVISOR_STATUS.CONNECTED ? 'connected' : tripadvisorRow.status);
   const dataSource = (status === 'limited_data_available' || status === 'connected') ? 'official_api' : 'unavailable';
+  const confidence = (typeof tripadvisorRow.confidence === 'number' && tripadvisorRow.confidence !== null)
+    ? tripadvisorRow.confidence
+    : (status === 'limited_data_available' ? 70 : 20);
   return {
     platform: 'Tripadvisor',
     status,
-    confidence: status === 'limited_data_available' ? 70 : 20,
+    confidence,
+    verified: !!tripadvisorRow.verified,
     data_source: dataSource,
     listing_url: tripadvisorRow.profile_url || null,
     customer_message: tripadvisorRow.message || TRIPADVISOR_CUSTOMER_WORDING,
     revenue_relevance: 'Medium to High - Tripadvisor influences guest research and trust; urgent negative reviews can affect direct and indirect bookings quickly.',
     next_action: status === 'limited_data_available'
-      ? 'Monitor reputation signal and review profile consistency.'
+      ? 'Monitor reputation signal and verify profile consistency.'
       : 'Connect the official Tripadvisor Content API to enable the reputation signal.',
     raw_data: { rating: tripadvisorRow.rating || null, review_count: tripadvisorRow.review_count || null }
   };
