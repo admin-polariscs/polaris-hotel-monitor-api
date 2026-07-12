@@ -50,14 +50,18 @@ async function tripadvisorFetch(path, params) {
   if (!key) return { ok: false, reason: 'api_key_missing' };
   const qs = new URLSearchParams({ ...params, key, language: 'en' });
   try {
-    const r = await fetch(`${TRIPADVISOR_API_BASE}${path}?${qs.toString()}`, {
-      headers: { accept: 'application/json' }
-    });
-    const data = await r.json().catch(() => null);
-    if (!r.ok) return { ok: false, reason: 'api_error', status: r.status, data };
-    return { ok: true, data };
+          const r = await fetch(`${TRIPADVISOR_API_BASE}${path}?${qs.toString()}`, {
+                    headers: { accept: 'application/json' }
+          });
+          const data = await r.json().catch(() => null);
+          if (!r.ok) {
+                    console.error('[tripadvisor] api_error', { path, status: r.status, data: data ? JSON.stringify(data).slice(0, 500) : null });
+                    return { ok: false, reason: 'api_error', status: r.status, data };
+          }
+          return { ok: true, data };
   } catch (err) {
-    return { ok: false, reason: 'network_error', message: err.message };
+          console.error('[tripadvisor] network_error', { path, message: err.message });
+          return { ok: false, reason: 'network_error', message: err.message };
   }
 }
 
@@ -311,7 +315,7 @@ export async function fetchTripadvisorData(entity) {
       recommended_response_needed: false,
       sentiment_summary: EMPTY_SENTIMENT_SUMMARY,
       recommended_action: 'No confident Tripadvisor match found yet; try syncing again once more hotel details are available.',
-      raw_data: { searchError: searchResult.reason || null },
+      raw_data: { searchError: searchResult.reason || null, searchErrorStatus: searchResult.status || null, searchErrorDetail: searchResult.message || (searchResult.data && JSON.stringify(searchResult.data).slice(0, 300)) || null },
       last_synced_at: new Date().toISOString()
     };
   }
@@ -338,7 +342,7 @@ export async function fetchTripadvisorData(entity) {
       recommended_response_needed: false,
       sentiment_summary: EMPTY_SENTIMENT_SUMMARY,
       recommended_action: 'Tripadvisor details unavailable right now; try syncing again later.',
-      raw_data: { detailsError: detailsResult.reason || null },
+      raw_data: { detailsError: detailsResult.reason || null, detailsErrorStatus: detailsResult.status || null, detailsErrorDetail: detailsResult.message || (detailsResult.data && JSON.stringify(detailsResult.data).slice(0, 300)) || null },
       last_synced_at: new Date().toISOString()
     };
   }
