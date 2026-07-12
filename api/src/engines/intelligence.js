@@ -215,6 +215,113 @@ note:'Automatic public discovery candidate prepared. This is a search-style star
 });
 }
 
+// V3.9: OTA Evidence Layer. Turns each discovery-candidate item into a structured,
+// customer-safe evidence record. Never marks a discovery candidate as a found/verified
+// listing - status stays 'discovery_candidate' unless a real confirmed listingUrl exists.
+function otaRevenueRelevance(platformName){
+const map={
+'Booking.com':'High - Booking.com is typically one of the largest indirect revenue and commission-cost channels; confirming parity here protects margin.',
+'Expedia':'High - Expedia Group brands often drive significant indirect bookings; rate or inventory mismatches directly affect margin.',
+'Hotels.com':'Medium - shares inventory with Expedia Group; still worth confirming for rate parity.',
+'Tripadvisor':'Medium - influences guest research and trust even when bookings route elsewhere.',
+'Agoda':'Medium - important for Asia-sourced demand; relevant for hotels with international guests.',
+'Google Hotels':'High - directly influences the "book on Google" path and Google Business Profile visibility.'
+};
+return map[platformName] || 'Relevance not yet assessed for this platform.';
+}
+
+function buildOtaEvidence(entity,otas){
+const hasRealName = !!entity.name && entity.nameSource!=='domain_fallback';
+return otas.map((item)=>{
+const hasRealListing = !!item.listingUrl;
+const status = hasRealListing ? (item.verificationStatus==='verified' ? 'verified' : 'unverified') : 'discovery_candidate';
+const dataSource = hasRealListing ? 'website_scan' : 'discovery_candidate';
+let customerMessage = hasRealListing
+? (status==='verified' ? `${item.name} listing verified.` : `${item.name} listing found but not yet verified.`)
+: `${item.name} discovery candidate prepared. This is a starting point only, not a confirmed listing.`;
+if(!hasRealName){ customerMessage += ' Hotel identity was not confidently confirmed, so treat this as low-confidence.'; }
+const nextAction = hasRealListing
+? `Review the ${item.name} listing directly to confirm rates and parity.`
+: `Connect an official ${item.name} data source (partner or connectivity API) to confirm this listing automatically.`;
+return {
+platform: item.name,
+status,
+confidence: item.confidence,
+data_source: dataSource,
+listing_url: hasRealListing ? item.listingUrl : null,
+customer_message: customerMessage,
+revenue_relevance: otaRevenueRelevance(item.name),
+next_action: nextAction,
+raw_data: { search_query: item.searchQuery || null, search_url: item.searchUrl || null }
+};
+});
+}
+
+// V3.9: Revenue Value Layer. Combines existing scores/leaks/OTA evidence into a
+// commercial view for hotel managers. Purely derived from data already produced by
+// this scan (plus any Google connector state a caller may have applied to otaEvidence
+// beforehand) - no new scraping or claims are introduced here.
+function monitoringMaturity(ws,otaEvidence){
+let points=0;
+if(ws.hasGAorGTM) points+=25;
+if(ws.hasHotelSchema) points+=15;
+const connectedOta = otaEvidence.some((e)=>e.data_source==='official_api'||e.data_source==='connected_account');
+if(connectedOta) points+=35;
+const anyVerified = otaEvidence.some((e)=>e.status==='verified');
+if(anyVerified) points+=25;
+points = Math.min(100,points);
+let level='basic';
+if(points>=70) level='mature'; else if(points>=35) level='developing';
+return {score:points, level};
+}
+
+export function computeRevenueValue({entity,website,performance,scores,revenueLeaks,otaEvidence}){
+const ws = website || {};
+const directBookingRisk = Math.max(0,Math.min(100,Math.round((ws.hasBookingCta?20:70)*0.6 + (ws.hasGAorGTM?10:40)*0.4)));
+
+const verifiedOtaCount = otaEvidence.filter((e)=>e.status==='verified').length;
+const unverifiedOrCandidateCount = otaEvidence.filter((e)=>e.status==='unverified'||e.status==='discovery_candidate').length;
+const otaRevenueRisk = Math.max(0,Math.min(100,Math.round(
+verifiedOtaCount>0 ? Math.max(0,35-verifiedOtaCount*5) : 70+Math.min(unverifiedOrCandidateCount,5)*3
+)));
+
+const guestTrustScore = Math.max(0,Math.min(100,scores.trust));
+const visibilityRisk = Math.max(0,Math.min(100,Math.round((100-scores.aiVisibility)*0.6 + (entity.confidence<60?25:0))));
+const maturity = monitoringMaturity(ws,otaEvidence);
+const revenueOpportunityScore = Math.max(0,Math.min(100,Math.round(
+scores.booking*0.3 + scores.performance*0.2 + scores.trust*0.2 + (100-otaRevenueRisk)*0.15 + maturity.score*0.15
+)));
+
+const otaLeaks = otaEvidence.filter((e)=>e.status!=='verified').slice(0,2).map((e)=>({
+priority: (e.platform==='Google Hotels'||e.platform==='Booking.com') ? 'High' : 'Medium',
+title: `${e.platform} listing is not yet confirmed`,
+impact: e.revenue_relevance,
+fix: e.next_action
+}));
+
+const rank={High:0,Medium:1,Low:2};
+const combinedLeaks = [...revenueLeaks, ...otaLeaks].sort((a,b)=>(rank[a.priority]??3)-(rank[b.priority]??3));
+const topRevenueLeaks = combinedLeaks.slice(0,5);
+const nextBestActions = topRevenueLeaks.map((l,i)=>({rank:i+1, action:l.fix, why:l.impact}));
+
+const managementSummary = `${entity.name} has a revenue opportunity score of ${revenueOpportunityScore}/100. ` +
+`${verifiedOtaCount>0 ? `${verifiedOtaCount} OTA listing(s) are confirmed` : 'No OTA listings are confirmed yet'}, ` +
+`and monitoring maturity is currently ${maturity.level}. ` +
+`${topRevenueLeaks.length ? `The top opportunity is: ${topRevenueLeaks[0].title}.` : 'No major revenue leaks were detected in this scan.'}`;
+
+return {
+revenue_opportunity_score: revenueOpportunityScore,
+direct_booking_risk: directBookingRisk,
+ota_revenue_risk: otaRevenueRisk,
+guest_trust_score: guestTrustScore,
+visibility_risk: visibilityRisk,
+monitoring_maturity: maturity,
+top_revenue_leaks: topRevenueLeaks,
+next_best_actions: nextBestActions,
+management_summary: managementSummary
+};
+}
+
 function discoverCompetitors(entity){
 const city=entity.city||'nearby'; const base=entity.name||'this hotel';
 return {status:'discovery-ready',query:`hotels similar to ${base} ${city}`,items:[
@@ -242,5 +349,5 @@ let entity=hotelEntity(meta.finalUrl,$);
 const ws=websiteSignals($,meta.html,meta);
 entity=await refineEntityWithAi(entity,ws);
 const ps=await pagespeed(meta.finalUrl); const scores=score(ws,ps); const revenueLeaks=leaks(ws,ps,entity); const otas=discoverOtas(entity); const competitors=discoverCompetitors(entity);
-return {scanId:crypto.randomUUID(),generatedAt:new Date().toISOString(),inputUrl:url,finalUrl:meta.finalUrl,entity,scores,website:ws,performance:ps,ota:{status:'automatic-discovery-v1',items:otas},reviews:{status:'prepared',note:'Google/Booking/Tripadvisor review engines are ready for API-based integration. No manual review fields are used.'},competitors,aiVisibility:{status:'prepared',queries:[`best hotels ${entity.city||''}`,`business hotel ${entity.city||''}`,`${entity.name} hotel review`,`direct booking ${entity.name}`]},revenueLeaks,consultant:aiConsultant(entity,ws,scores,revenueLeaks)};
+return {scanId:crypto.randomUUID(),generatedAt:new Date().toISOString(),inputUrl:url,finalUrl:meta.finalUrl,entity,scores,website:ws,performance:ps,ota:{status:'automatic-discovery-v1',items:otas},reviews:{status:'prepared',note:'Google/Booking/Tripadvisor review engines are ready for API-based integration. No manual review fields are used.'},competitors,aiVisibility:{status:'prepared',queries:[`best hotels ${entity.city||''}`,`business hotel ${entity.city||''}`,`${entity.name} hotel review`,`direct booking ${entity.name}`]},revenueLeaks,consultant:aiConsultant(entity,ws,scores,revenueLeaks),ota_evidence:buildOtaEvidence(entity,otas)};
 }
