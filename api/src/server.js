@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { runHotelIntelligence } from './engines/intelligence.js';
+import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
 import {
     pool,
     normaliseDomain,
@@ -77,8 +77,10 @@ function buildSections(result) {
       },
       { section: 'competitors', score: null, summary: null, data: result.competitors },
       { section: 'revenue_leaks', score: null, summary: null, data: result.revenueLeaks },
-      { section: 'consultant', score: null, summary: result.consultant ? result.consultant.headline : null, data: result.consultant }
-        ];
+      { section: 'consultant', score: null, summary: result.consultant ? result.consultant.headline : null, data: result.consultant },
+    { section: 'ota_evidence', score: null, summary: null, data: result.ota_evidence },
+    { section: 'revenue_value', score: result.revenue_value ? result.revenue_value.revenue_opportunity_score : null, summary: result.revenue_value ? result.revenue_value.management_summary : null, data: result.revenue_value }
+  ];
 }
 
 async function persistScan({ scanRecord, hotelRecord, result }) {
@@ -144,6 +146,15 @@ app.post('/scan', async (req, res) => {
 
            try {
                  const result = await runHotelIntelligence(url);
+
+    result.revenue_value = computeRevenueValue({
+      entity: result.entity,
+      website: result.website,
+      performance: result.performance,
+      scores: result.scores,
+      revenueLeaks: result.revenueLeaks,
+      otaEvidence: result.ota_evidence
+    });
 
       if (pool && scanRecord && hotelRecord) {
               try {
@@ -231,9 +242,57 @@ app.get('/hotels/:id/discovery', async (req, res) => {
         : `${row.platform} discovery candidate prepared`;
       return { ...row, message };
     });
-    res.json({ discoveredListings, competitors: comps.rows });
+    
+    // V3.9: also surface the latest structured ota_evidence for this hotel (customer-safe
+    // wording, revenue relevance and next actions per platform), from the most recent scan.
+    let otaEvidence = [];
+    try {
+      const otaEvidenceResult = await pool.query(
+        `SELECT sr.data FROM scan_results sr
+         JOIN scans s ON s.id = sr.scan_id
+         WHERE s.hotel_id = $1 AND sr.section = 'ota_evidence'
+         ORDER BY sr.id DESC LIMIT 1`,
+        [req.params.id]
+      );
+      otaEvidence = otaEvidenceResult.rows.length ? otaEvidenceResult.rows[0].data : [];
+    } catch (otaErr) {
+      console.error('Failed to fetch latest ota_evidence:', otaErr.message);
+    }
+
+    res.json({ discoveredListings, competitors: comps.rows, otaEvidence });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch discovery data', message: err.message });
+  }
+});
+
+
+// V3.9: GET /hotels/:id/revenue - latest revenue_value layer for this hotel (from the most
+// recent completed scan). Read-only; does not trigger a new scan or any external API call.
+app.get('/hotels/:id/revenue', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const result = await pool.query(
+      `SELECT sr.data, s.id as scan_id, s.completed_at, s.started_at
+       FROM scan_results sr
+       JOIN scans s ON s.id = sr.scan_id
+       WHERE s.hotel_id = $1 AND sr.section = 'revenue_value'
+       ORDER BY sr.id DESC LIMIT 1`,
+      [req.params.id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: 'No revenue value data found for this hotel yet',
+        message: 'Run a scan first via POST /scan.'
+      });
+    }
+    const row = result.rows[0];
+    res.json({
+      scanId: row.scan_id,
+      generatedAt: row.completed_at || row.started_at,
+      revenue_value: row.data
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch revenue value', message: err.message });
   }
 });
 
