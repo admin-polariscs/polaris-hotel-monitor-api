@@ -238,6 +238,284 @@ app.get('/hotels/:id/discovery', async (req, res) => {
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// Google Business Profile connector
+// Uses only the official Google OAuth2 + Business Profile APIs. Never scrapes
+// reviews. Credentials (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET /
+// GOOGLE_OAUTH_REDIRECT_URI) are read only from environment variables and are
+// never hardcoded or logged.
+
+async function refreshGoogleAccessToken(connection) {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  if (!clientId || !clientSecret || !connection.refresh_token) return null;
+  try {
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: connection.refresh_token,
+        grant_type: 'refresh_token'
+      }).toString()
+    });
+    const tokens = await tokenRes.json();
+    if (!tokenRes.ok) {
+      console.error('Google token refresh failed:', tokens.error || tokens);
+      return null;
+    }
+    const expiry = tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null;
+    await pool.query(
+      'UPDATE google_connections SET access_token = $1, token_expiry = $2, updated_at = now() WHERE id = $3',
+      [tokens.access_token, expiry, connection.id]
+    );
+    return tokens.access_token;
+  } catch (err) {
+    console.error('Google token refresh error:', err.message);
+    return null;
+  }
+}
+
+async function getValidGoogleAccessToken(connection) {
+  const isExpired = !connection.token_expiry || new Date(connection.token_expiry).getTime() < Date.now() + 60000;
+  if (!isExpired && connection.access_token) return connection.access_token;
+  return refreshGoogleAccessToken(connection);
+}
+
+app.get('/connect/google', (req, res) => {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  if (!clientId || !redirectUri) {
+    return res.status(503).json({
+      error: 'Google connector not configured',
+      message: 'Set GOOGLE_CLIENT_ID and GOOGLE_OAUTH_REDIRECT_URI in the environment first.'
+    });
+  }
+  let state = '';
+  if (req.query.hotelId) {
+    state = Buffer.from(JSON.stringify({ hotelId: req.query.hotelId })).toString('base64url');
+  }
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'https://www.googleapis.com/auth/business.manage',
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: 'true'
+  });
+  if (state) params.set('state', state);
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+app.get('/oauth/google/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error) return res.status(400).json({ error: 'Google OAuth error', message: String(error) });
+  if (!code) return res.status(400).json({ error: 'Missing authorization code' });
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  if (!clientId || !clientSecret || !redirectUri) {
+    return res.status(503).json({ error: 'Google connector not configured' });
+  }
+
+  let hotelId = null;
+  if (state) {
+    try {
+      const decoded = JSON.parse(Buffer.from(String(state), 'base64url').toString('utf8'));
+      hotelId = decoded.hotelId || null;
+    } catch (_) {
+      hotelId = null;
+    }
+  }
+
+  try {
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: String(code),
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code'
+      }).toString()
+    });
+    const tokens = await tokenRes.json();
+    if (!tokenRes.ok) {
+      console.error('Google token exchange failed:', tokens.error || tokens);
+      return res.status(502).json({
+        error: 'Token exchange failed',
+        message: tokens.error_description || tokens.error || 'Unknown error'
+      });
+    }
+
+    const expiry = tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null;
+    await pool.query(
+      `INSERT INTO google_connections (hotel_id, access_token, refresh_token, token_expiry, scope, status)
+       VALUES ($1, $2, $3, $4, $5, 'connected')`,
+      [hotelId, tokens.access_token || null, tokens.refresh_token || null, expiry, tokens.scope || null]
+    );
+
+    res.json({ ok: true, message: 'Google account connected successfully.', hotelId: hotelId || null });
+  } catch (err) {
+    console.error('Google OAuth callback failed:', err.message);
+    res.status(500).json({ error: 'Google OAuth callback failed', message: err.message });
+  }
+});
+
+app.get('/google/locations', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const hotelId = req.query.hotelId || null;
+    const connResult = hotelId
+      ? await pool.query('SELECT * FROM google_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1', [hotelId])
+      : await pool.query('SELECT * FROM google_connections ORDER BY id DESC LIMIT 1');
+
+    if (!connResult.rows.length) {
+      return res.status(404).json({
+        error: 'No Google connection found',
+        message: 'Connect a Google account first via /connect/google'
+      });
+    }
+
+    const connection = connResult.rows[0];
+    const accessToken = await getValidGoogleAccessToken(connection);
+    if (!accessToken) {
+      return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
+    }
+
+    const accountsRes = await fetch('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    const accountsData = await accountsRes.json();
+    if (!accountsRes.ok) {
+      return res.status(502).json({
+        error: 'Failed to list Google Business accounts',
+        message: (accountsData.error && accountsData.error.message) || 'Unknown error'
+      });
+    }
+
+    const accounts = accountsData.accounts || [];
+    const results = [];
+    let hotelDomain = null;
+    if (hotelId) {
+      const hotelRes = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+      hotelDomain = hotelRes.rows.length ? hotelRes.rows[0].domain : null;
+    }
+
+    for (const account of accounts) {
+      const locRes = await fetch(
+        `https://mybusinessbusinessinformation.googleapis.com/v1/${account.name}/locations?readMask=name,title,storefrontAddress,phoneNumbers,websiteUri`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const locData = await locRes.json();
+      if (!locRes.ok) {
+        results.push({
+          account: account.name,
+          accountName: account.accountName,
+          error: (locData.error && locData.error.message) || 'Failed to list locations'
+        });
+        continue;
+      }
+
+      const locations = (locData.locations || []).map((loc) => {
+        const addr = loc.storefrontAddress;
+        const address = addr
+          ? [addr.addressLines ? addr.addressLines.join(', ') : null, addr.locality, addr.administrativeArea, addr.postalCode, addr.regionCode]
+              .filter(Boolean)
+              .join(', ')
+          : null;
+        return {
+          locationId: loc.name,
+          name: account.accountName,
+          title: loc.title,
+          address,
+          phone: (loc.phoneNumbers && loc.phoneNumbers.primaryPhone) || null,
+          website: loc.websiteUri || null
+        };
+      });
+
+      if (hotelId && hotelDomain) {
+        const match = locations.find((loc) => loc.website && normaliseDomain(loc.website) === hotelDomain);
+        if (match) {
+          await pool.query(
+            `UPDATE google_connections
+             SET location_id = $1, location_name = $2, google_account_id = $3, google_account_name = $4,
+                 status = 'matched', updated_at = now()
+             WHERE id = $5`,
+            [match.locationId, match.title || match.name, account.name, account.accountName, connection.id]
+          );
+        }
+      }
+
+      results.push({ account: account.name, accountName: account.accountName, locations });
+    }
+
+    res.json({ accounts: results });
+  } catch (err) {
+    console.error('Failed to list Google locations:', err.message);
+    res.status(500).json({ error: 'Failed to list Google locations', message: err.message });
+  }
+});
+
+app.get('/hotels/:id/reviews', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const connResult = await pool.query(
+      'SELECT * FROM google_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1',
+      [req.params.id]
+    );
+
+    if (!connResult.rows.length) {
+      return res.json({ connector: 'google', status: 'Google not connected' });
+    }
+
+    const connection = connResult.rows[0];
+    if (!connection.location_id) {
+      return res.json({ connector: 'google', status: 'Google connected, location not matched yet' });
+    }
+
+    const accessToken = await getValidGoogleAccessToken(connection);
+    if (!accessToken) {
+      return res.status(502).json({ error: 'Unable to obtain a valid Google access token' });
+    }
+
+    const reviewsRes = await fetch(`https://mybusiness.googleapis.com/v4/${connection.location_id}/reviews`, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    const reviewsData = await reviewsRes.json();
+    if (!reviewsRes.ok) {
+      return res.status(502).json({
+        error: 'Failed to fetch Google reviews',
+        message: (reviewsData.error && reviewsData.error.message) || 'Unknown error'
+      });
+    }
+
+    res.json({
+      connector: 'google',
+      status: 'matched',
+      locationId: connection.location_id,
+      locationName: connection.location_name,
+      reviews: (reviewsData.reviews || []).map((r) => ({
+        reviewId: r.reviewId,
+        reviewer: r.reviewer ? r.reviewer.displayName : null,
+        starRating: r.starRating,
+        comment: r.comment,
+        createTime: r.createTime,
+        updateTime: r.updateTime
+      }))
+    });
+  } catch (err) {
+    console.error('Failed to fetch hotel reviews:', err.message);
+    res.status(500).json({ error: 'Failed to fetch reviews', message: err.message });
+  }
+});
+
 app.listen(port, () => {
     console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
 });
