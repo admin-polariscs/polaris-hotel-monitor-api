@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
-import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
+import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, getTripadvisorApiMode, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
 import {
     pool,
     normaliseDomain,
@@ -357,27 +357,32 @@ app.get('/tripadvisor/status', (req, res) => {
 const TRIPADVISOR_SYNC_MIN_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
 
 function formatTripadvisorRow(row, source, messageOverride, wordingOverride) {
-  return {
-    status: row.status,
-    message: messageOverride || (row.status === TRIPADVISOR_STATUS.LIMITED_DATA_AVAILABLE
-      ? 'Tripadvisor data is available as a limited reputation signal.'
-      : 'Tripadvisor connector not configured yet.'),
-    wording: wordingOverride || 'Tripadvisor Reputation Signal uses limited recent review data available through the official API.',
-    location_id: row.location_id,
-    profile_url: row.profile_url,
-    rating: row.rating,
-    review_count: row.review_count,
-    confidence: row.confidence,
-    verified: row.verified,
-    limited_recent_reviews: row.limited_recent_reviews || [],
-    negative_review_detected: row.negative_review_detected,
-    urgent_negative_detected: row.urgent_negative_detected,
-    sentiment_summary: row.sentiment_summary,
-    recommended_action: row.recommended_action,
-    last_synced_at: row.last_synced_at,
-    raw_data: row.raw_data,
-    source
-  };
+	    const isTerra = row.api_mode === 'terra';
+	    const defaultLimitedMessage = isTerra
+	      ? 'Tripadvisor Terra data is available as a limited reputation signal.'
+			      : 'Tripadvisor data is available as a limited reputation signal.';
+	    return {
+			      status: row.status,
+			      api_mode: row.api_mode || null,
+			      message: messageOverride || (row.status === TRIPADVISOR_STATUS.LIMITED_DATA_AVAILABLE
+											           ? defaultLimitedMessage
+											           : 'Tripadvisor connector not configured yet.'),
+			      wording: wordingOverride || 'Tripadvisor Reputation Signal uses limited recent review data available through the official API.',
+			      location_id: row.location_id,
+			      profile_url: row.profile_url,
+			      rating: row.rating,
+			      review_count: row.review_count,
+			      confidence: row.confidence,
+			      verified: row.verified,
+			      limited_recent_reviews: row.limited_recent_reviews || [],
+			      negative_review_detected: row.negative_review_detected,
+			      urgent_negative_detected: row.urgent_negative_detected,
+			      sentiment_summary: row.sentiment_summary,
+			      recommended_action: row.recommended_action,
+			      last_synced_at: row.last_synced_at,
+			      raw_data: row.raw_data,
+			      source
+		};
 }
 
 // GET /hotels/:id/tripadvisor - read-only. Returns the cached Tripadvisor Reputation Signal.
@@ -487,31 +492,32 @@ app.post('/hotels/:id/tripadvisor/sync', async (req, res) => {
     const data = await fetchTripadvisorData(entity);
 
     const insertResult = await pool.query(
-      `INSERT INTO tripadvisor_connections
-        (hotel_id, location_id, profile_url, rating, review_count, photos_count, confidence, verified,
-         limited_recent_reviews, sentiment_summary, negative_review_detected, urgent_negative_detected,
-         recommended_response_needed, recommended_action, status, raw_data, last_synced_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now(), now())
-       RETURNING *`,
-      [
-        hotelId,
-        data.location_id,
-        data.profile_url,
-        data.rating,
-        data.review_count,
-        data.photos_count,
-        data.confidence,
-        !!data.verified,
-        JSON.stringify(data.limited_recent_reviews || []),
-        JSON.stringify(data.sentiment_summary || null),
-        !!data.negative_review_detected,
-        !!data.urgent_negative_detected,
-        !!data.recommended_response_needed,
-        data.recommended_action || null,
-        data.status,
-        JSON.stringify(data.raw_data || null)
-      ]
-    );
+		      `INSERT INTO tripadvisor_connections
+			          (hotel_id, location_id, profile_url, rating, review_count, photos_count, confidence, verified,
+					           limited_recent_reviews, sentiment_summary, negative_review_detected, urgent_negative_detected,
+							            recommended_response_needed, recommended_action, status, raw_data, api_mode, last_synced_at, updated_at)
+										       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now(), now())
+											          RETURNING *`,
+		      [
+				          hotelId,
+				          data.location_id,
+				          data.profile_url,
+				          data.rating,
+				          data.review_count,
+				          data.photos_count,
+				          data.confidence,
+				          !!data.verified,
+				          JSON.stringify(data.limited_recent_reviews || []),
+				          JSON.stringify(data.sentiment_summary || null),
+				          !!data.negative_review_detected,
+				          !!data.urgent_negative_detected,
+				          !!data.recommended_response_needed,
+				          data.recommended_action || null,
+				          data.status,
+				          JSON.stringify(data.raw_data || null),
+				          data.api_mode || getTripadvisorApiMode()
+				        ]
+		    );
 
     res.json(formatTripadvisorRow(insertResult.rows[0], 'live', data.message, data.wording));
   } catch (err) {
