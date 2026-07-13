@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
-import { runHotelIntelligence } from './engines/intelligence.js';
+import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
+import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, getTripadvisorApiMode, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
 import {
     pool,
     normaliseDomain,
@@ -77,7 +78,9 @@ function buildSections(result) {
       },
       { section: 'competitors', score: null, summary: null, data: result.competitors },
       { section: 'revenue_leaks', score: null, summary: null, data: result.revenueLeaks },
-      { section: 'consultant', score: null, summary: result.consultant ? result.consultant.headline : null, data: result.consultant }
+      { section: 'consultant', score: null, summary: result.consultant ? result.consultant.headline : null, data: result.consultant },
+        { section: 'ota_evidence', score: null, summary: null, data: result.ota_evidence },
+        { section: 'revenue_value', score: result.revenue_value ? result.revenue_value.revenue_opportunity_score : null, summary: result.revenue_value ? result.revenue_value.management_summary : null, data: result.revenue_value }
         ];
 }
 
@@ -123,6 +126,33 @@ if (result.competitors && Array.isArray(result.competitors.items)) {
   await completeScan(scanRecord.id);
 }
 
+// Avoids re-hitting the official API on every request/page refresh. A sync within this
+// window returns the cached row instead of calling Tripadvisor again, unless force=true.
+const TRIPADVISOR_SYNC_MIN_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
+
+// Reflects the latest CACHED Tripadvisor connector state (from tripadvisor_connections)
+// onto the Tripadvisor ota_evidence entry. No live Tripadvisor API call is made here - this
+// only reads cached connector state, so it never consumes Tripadvisor quota or scrapes.
+async function applyTripadvisorStatusToOtaEvidence(otaEvidence, hotelId) {
+      const tripEntryIndex = Array.isArray(otaEvidence) ? otaEvidence.findIndex((e) => e.platform === 'Tripadvisor') : -1;
+      if (tripEntryIndex === -1) return otaEvidence;
+    
+      if (!pool || !hotelId) return otaEvidence;
+    
+      try {
+              const row = await pool.query(
+                        'SELECT * FROM tripadvisor_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1',
+                        [hotelId]
+                      );
+              if (!row.rows.length) return otaEvidence;
+              const built = buildTripadvisorOtaEvidenceEntry(row.rows[0]);
+              if (built) otaEvidence[tripEntryIndex] = built;
+      } catch (err) {
+              console.error('Failed to check Tripadvisor connector status for ota_evidence:', err.message);
+      }
+      return otaEvidence;
+}
+
 app.post('/scan', async (req, res) => {
     const { url } = req.body || {};
     if (!url) return res.status(400).json({ error: 'Missing url' });
@@ -144,6 +174,16 @@ app.post('/scan', async (req, res) => {
 
            try {
                  const result = await runHotelIntelligence(url);
+
+                     await applyTripadvisorStatusToOtaEvidence(result.ota_evidence, hotelRecord ? hotelRecord.id : null);
+                     result.revenue_value = computeRevenueValue({
+                                 entity: result.entity,
+                                 website: result.website,
+                                 performance: result.performance,
+                                 scores: result.scores,
+                                 revenueLeaks: result.revenueLeaks,
+                                 otaEvidence: result.ota_evidence
+                     });
 
       if (pool && scanRecord && hotelRecord) {
               try {
