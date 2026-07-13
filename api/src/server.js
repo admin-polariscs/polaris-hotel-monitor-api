@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
 import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, getTripadvisorApiMode, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
+import { getCompetitorsConnectorStatus, getGooglePlacesApiKey, resolveHotelLocation, searchNearbyHotels, classifyCompetitor } from './engines/googlePlaces.js';
 import {
     pool,
     normaliseDomain,
@@ -496,6 +497,148 @@ app.get('/hotels/:id/revenue', async (req, res) => {
       } catch (err) {
               res.status(500).json({ error: 'Failed to fetch revenue value', message: err.message });
       }
+});
+
+// GET /competitors/status - Google Places (New) competitor discovery connector status.
+// Server-side key only, never exposed to the client. No OAuth/login involved.
+app.get('/competitors/status', (req, res) => {
+        res.json(getCompetitorsConnectorStatus());
+});
+
+// POST /hotels/:id/competitors/discover - finds potential hotel competitors within
+// 20km of the hotel using Google Places API (New). Scores and classifies each result
+// instead of returning every nearby hotel as a competitor.
+app.post('/hotels/:id/competitors/discover', async (req, res) => {
+        if (!pool) return res.status(503).json({ error: 'Database not configured' });
+        const hotelId = req.params.id;
+
+             if (!getGooglePlacesApiKey()) {
+                         return res.json({
+                                         status: 'not_configured',
+                                         message: 'Google Places competitor discovery is not configured yet.'
+                         });
+             }
+
+             try {
+                         const hotelResult = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+                         if (!hotelResult.rows.length) return res.status(404).json({ error: 'Hotel not found' });
+                         const hotel = hotelResult.rows[0];
+
+            let lat = hotel.latitude !== null ? Number(hotel.latitude) : null;
+                         let lng = hotel.longitude !== null ? Number(hotel.longitude) : null;
+                         let locationSource = 'stored';
+
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+                            const resolved = await resolveHotelLocation(hotel);
+                            if (!resolved) {
+                                                return res.json({
+                                                                        status: 'location_unresolved',
+                                                                        message: 'Could not resolve this hotel\'s location via Google Places.'
+                                                });
+                            }
+                            lat = resolved.lat;
+                            lng = resolved.lng;
+                            locationSource = 'resolved_via_google_places';
+                            await pool.query(
+                                                'UPDATE hotels SET latitude = $1, longitude = $2, updated_at = now() WHERE id = $3',
+                                                [lat, lng, hotelId]
+                                            );
+            }
+
+            const MAX_RAW_CANDIDATES = 60;
+                 const MAX_PRIMARY = 5;
+                 const MAX_SECONDARY = 7;
+                 const MAX_VISIBLE_TOTAL = 12;
+
+    const rawCandidates = (await searchNearbyHotels(lat, lng, 20000)).slice(0, MAX_RAW_CANDIDATES);
+                 const classified = rawCandidates.map((c) => classifyCompetitor(c, hotel, { lat, lng }));
+
+    const byRank = (a, b) => {
+        if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+        const da = a.distance_km === null ? Infinity : a.distance_km;
+        const db = b.distance_km === null ? Infinity : b.distance_km;
+        return da - db;
+    };
+
+    const primaryAll = classified.filter((c) => c.competitor_type === 'primary_competitor').sort(byRank);
+                 const secondaryAll = classified.filter((c) => c.competitor_type === 'secondary_competitor').sort(byRank);
+                 const nearbyNotComparable = classified.filter((c) => c.competitor_type === 'nearby_not_comparable').sort(byRank);
+                 const excludedList = classified.filter((c) => c.competitor_type === 'excluded');
+
+    const primaryVisible = primaryAll.slice(0, MAX_PRIMARY);
+                 let secondaryVisible = secondaryAll.slice(0, MAX_SECONDARY);
+                 if (primaryVisible.length + secondaryVisible.length > MAX_VISIBLE_TOTAL) {
+                     secondaryVisible = secondaryVisible.slice(0, Math.max(0, MAX_VISIBLE_TOTAL - primaryVisible.length));
+                 }
+
+    // Idempotent by design: replace this hotel's Google Places competitive set rather
+    // than appending, so repeated discover calls update instead of duplicating rows.
+    // Only useful candidates (primary/secondary) are persisted - nearby_not_comparable
+    // and excluded are returned in the response for transparency only, never stored.
+    await pool.query(
+        "DELETE FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places'",
+        [hotelId]
+        );
+
+    for (const item of [...primaryVisible, ...secondaryVisible]) {
+        await storeCompetitor({
+            hotelId,
+            name: item.name,
+            website: item.website || null,
+            city: hotel.city || null,
+            platformSource: 'google_places',
+            confidence: item.confidence,
+            distanceKm: item.distance_km,
+            rawData: item
+        });
+    }
+
+    res.json({
+        hotel_id: Number(hotelId),
+        location_source: locationSource,
+        primary_competitors: primaryVisible,
+        secondary_competitors: secondaryVisible,
+        nearby_not_comparable: nearbyNotComparable,
+        excluded: excludedList,
+        summary: {
+            raw_candidates_found: rawCandidates.length,
+            primary_count: primaryVisible.length,
+            secondary_count: secondaryVisible.length,
+            nearby_not_comparable_count: nearbyNotComparable.length,
+            excluded_count: excludedList.length
+        }
+    });
+             } catch (err) {
+                 console.error('Competitor discovery error', err);
+                 res.status(500).json({ error: 'Failed to discover competitors', message: err.message });
+             }
+});
+
+// GET /hotels/:id/competitors - cached Google Places competitive set for this hotel.
+// Read-only; never makes a live API call. Call the /discover endpoint above to refresh.
+// Only primary/secondary competitors are ever persisted (excluded rows are never stored).
+app.get('/hotels/:id/competitors', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'Database not configured' });
+    try {
+        const result = await pool.query(
+            "SELECT id, name, website, city, platform_source, confidence, distance_km, raw_data, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' ORDER BY confidence DESC NULLS LAST, distance_km ASC NULLS LAST",
+            [req.params.id]
+            );
+        const rows = result.rows;
+        const primary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'primary_competitor');
+        const secondary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'secondary_competitor');
+        res.json({
+            hotel_id: Number(req.params.id),
+            primary_competitors: primary,
+            secondary_competitors: secondary,
+            summary: {
+                primary_count: primary.length,
+                secondary_count: secondary.length
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
+    }
 });
 
 app.listen(port, () => {
