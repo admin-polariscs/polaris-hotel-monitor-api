@@ -48,42 +48,218 @@ function haversineKm(lat1, lng1, lat2, lng2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// googlePlaces.js
+
+// ISO 3166-1 alpha-2 region codes for hotel countries we commonly see. Used only as an
+// optional bias for Google Places Text Search (New) - never hardcoded to a single country.
+// If a hotel's country is not in this map, no region bias is applied (graceful fallback).
+const COUNTRY_REGION_CODES = {
+    'belgium': 'BE', 'germany': 'DE', 'netherlands': 'NL', 'the netherlands': 'NL',
+    'france': 'FR', 'luxembourg': 'LU', 'spain': 'ES', 'italy': 'IT', 'portugal': 'PT',
+    'united kingdom': 'GB', 'uk': 'GB', 'england': 'GB', 'scotland': 'GB', 'wales': 'GB',
+    'ireland': 'IE', 'austria': 'AT', 'switzerland': 'CH', 'denmark': 'DK', 'sweden': 'SE',
+    'norway': 'NO', 'finland': 'FI', 'poland': 'PL', 'czech republic': 'CZ', 'czechia': 'CZ',
+    'hungary': 'HU', 'greece': 'GR', 'croatia': 'HR', 'slovenia': 'SI', 'slovakia': 'SK',
+    'romania': 'RO', 'bulgaria': 'BG', 'united states': 'US', 'usa': 'US',
+    'united states of america': 'US', 'canada': 'CA', 'japan': 'JP', 'south korea': 'KR',
+    'australia': 'AU', 'new zealand': 'NZ', 'mexico': 'MX', 'brazil': 'BR', 'argentina': 'AR',
+    'india': 'IN', 'china': 'CN', 'singapore': 'SG', 'thailand': 'TH', 'uae': 'AE',
+    'united arab emirates': 'AE'
+};
+
+const GENERIC_NAME_WORDS = new Set([
+    'hotel', 'hotels', 'the', 'and', 'de', 'du', 'la', 'le', 'inn', 'suites', 'suite',
+    'resort', 'residence', 'house', 'grand'
+    ]);
+// Returns a bare comparable hostname (no protocol, no www, no path) or null.
+function normaliseHost(value) {
+    if (!value) return null;
+    try {
+        const withProto = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+        const host = new URL(withProto).hostname.toLowerCase();
+        return host.replace(/^www\./, '');
+    } catch (err) {
+        return String(value).toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0] || null;
+    }
+}
+
+// Looks up an ISO region code for a hotel's country. Returns null (no bias applied)
+// if the country is missing or not in the map - never restricts to one country.
+function countryToRegionCode(country) {
+    if (!country) return null;
+    return COUNTRY_REGION_CODES[String(country).trim().toLowerCase()] || null;
+}
+
+function significantWords(name) {
+    if (!name) return [];
+    return String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w && !GENERIC_NAME_WORDS.has(w));
+}
+
+// Dependency-free Jaccard-like similarity over significant (non-generic) words.
+function nameSimilarity(a, b) {
+    const wa = new Set(significantWords(a));
+    const wb = new Set(significantWords(b));
+    if (!wa.size || !wb.size) return 0;
+    let shared = 0;
+    for (const w of wa) if (wb.has(w)) shared++;
+    return shared / new Set([...wa, ...wb]).size;
+}
+
+// Pulls a specific Google addressComponents entry (e.g. country/locality) by type.
+function extractAddressComponent(components, wantedTypes) {
+    if (!Array.isArray(components)) return null;
+    const found = components.find(c => Array.isArray(c.types) && c.types.some(t => wantedTypes.includes(t)));
+    return found ? (found.longText || found.shortText || null) : null;
+}
+
+// Builds the Places Text Search query from whatever hotel context we have -
+// never hardcoded to a single city or country.
+function buildLocationQuery(hotel) {
+    return [hotel.name, hotel.address, hotel.city, hotel.country]
+    .filter(Boolean)
+    .join(', ');
+}
+// Scores a single Places candidate against the source hotel's own profile.
+// Returns { confidence: 'high'|'medium'|'low', reasons: [...], score, domainMatch, countryMatch, cityMatch }
+function scoreLocationCandidate(candidate, hotel) {
+    const reasons = [];
+    let score = 0;
+    
+    const hotelHost = normaliseHost(hotel.website || hotel.domain);
+    const candidateHost = normaliseHost(candidate.website);
+    const domainMatch = !!(hotelHost && candidateHost && hotelHost === candidateHost);
+    if (domainMatch) {
+        score += 3;
+        reasons.push('website domain matches hotel website');
+    }
+    
+    let countryMatch = null;
+    if (hotel.country) {
+        const expected = String(hotel.country).trim().toLowerCase();
+        const candidateCountry = (candidate.country_component || '').toLowerCase();
+        const addr = (candidate.formatted_address || '').toLowerCase();
+        countryMatch = (candidateCountry && (candidateCountry.includes(expected) || expected.includes(candidateCountry))) || addr.includes(expected);
+        if (countryMatch) {
+            score += 2;
+            reasons.push('country matches expected country');
+        } else {
+            score -= 5;
+            reasons.push('country does not match expected country');
+        }
+    }
+    
+    let cityMatch = null;
+    if (hotel.city) {
+        const expectedCity = String(hotel.city).trim().toLowerCase();
+        const candidateCity = (candidate.city_component || '').toLowerCase();
+        const addr = (candidate.formatted_address || '').toLowerCase();
+        cityMatch = (candidateCity && candidateCity.includes(expectedCity)) || addr.includes(expectedCity);
+        if (cityMatch) {
+            score += 1;
+            reasons.push('city matches expected city');
+        } else {
+            score -= 1;
+            reasons.push('city does not match expected city');
+        }
+    }
+    
+    const sim = nameSimilarity(hotel.name, candidate.name);
+    if (sim >= 0.5) {
+        score += 1;
+        reasons.push('name is a strong match');
+    } else if (sim < 0.2 && !domainMatch) {
+        score -= 1;
+        reasons.push('name similarity is weak');
+    }
+    
+    const hasContext = !!(hotel.address || hotel.city || hotel.country);
+    if (!hasContext && !domainMatch) {
+        score = Math.min(score, 0);
+        reasons.push('no address/city/country context available to verify this match');
+    }
+    
+    let confidence;
+    if (countryMatch === false) {
+        confidence = 'low';
+    } else if (score >= 4) {
+        confidence = 'high';
+    } else if (score >= 2) {
+        confidence = 'medium';
+    } else {
+        confidence = 'low';
+    }
+    
+    return { confidence, reasons, score, domainMatch, countryMatch, cityMatch };
+}
+
 // Resolves a hotel's lat/lng via Google Places Text Search (New) when it is not
-// already stored on the hotel record. Read-only lookup, no scraping.
+// already stored on the hotel record. Country-aware and hotel-profile-aware: builds
+// its query from the hotel's own name/address/city/country, and applies a region bias
+// only when the hotel's country maps to a known ISO region code. Never hardcoded to
+// any single country. Read-only lookup, no scraping.
+// Returns { top: <bestScoredCandidate|null>, candidates: [...scoredCandidates] }
 async function resolveHotelLocation(hotel) {
     const key = getGooglePlacesApiKey();
-    if (!key) return null;
-
-  const query = [hotel.name, hotel.address, hotel.city, hotel.country]
-      .filter(Boolean)
-      .join(', ');
-    if (!query) return null;
-
-  try {
+    if (!key) return { top: null, candidates: [] };
+    
+    const query = buildLocationQuery(hotel);
+    if (!query) return { top: null, candidates: [] };
+    
+    const regionCode = countryToRegionCode(hotel.country);
+    
+    try {
+        const requestBody = { textQuery: query, maxResultCount: 5 };
+        if (regionCode) requestBody.regionCode = regionCode;
+        
         const r = await fetch(`${PLACES_API_BASE}/places:searchText`, {
-                method: 'POST',
-                headers: {
-                          'Content-Type': 'application/json',
-                          'X-Goog-Api-Key': key,
-                          'X-Goog-FieldMask': 'places.id,places.location,places.formattedAddress'
-                },
-                body: JSON.stringify({ textQuery: query, maxResultCount: 1 })
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Goog-Api-Key': key,
+                'X-Goog-FieldMask':
+                    'places.id,places.displayName,places.formattedAddress,places.location,places.websiteUri,places.googleMapsUri,places.addressComponents'
+            },
+            body: JSON.stringify(requestBody)
         });
         const data = await r.json().catch(() => null);
         if (!r.ok) {
-                console.error('Google Places text search error', { status: r.status, data });
-                return null;
+            console.error('Google Places text search error', { status: r.status, data });
+            return { top: null, candidates: [] };
         }
-        const place = data && Array.isArray(data.places) ? data.places[0] : null;
-        if (!place || !place.location) return null;
-        const lat = place.location.latitude;
-        const lng = place.location.longitude;
-        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-        return { lat, lng, place_id: place.id || null, formatted_address: place.formattedAddress || null };
-  } catch (err) {
+        const places = (data && Array.isArray(data.places)) ? data.places : [];
+        
+        const candidates = places
+        .filter(place => place && place.location)
+        .map(place => {
+            const lat = place.location.latitude;
+            const lng = place.location.longitude;
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+            const candidate = {
+                place_id: place.id || null,
+                name: (place.displayName && place.displayName.text) || null,
+                formatted_address: place.formattedAddress || null,
+                website: place.websiteUri || null,
+                google_maps_url: place.googleMapsUri || null,
+                lat,
+                lng,
+                country_component: extractAddressComponent(place.addressComponents, ['country']),
+                city_component: extractAddressComponent(place.addressComponents, ['locality', 'postal_town', 'administrative_area_level_2'])
+            };
+            const scored = scoreLocationCandidate(candidate, hotel);
+            return { ...candidate, ...scored };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score);
+        
+        return { top: candidates[0] || null, candidates };
+    } catch (err) {
         console.error('Google Places text search request failed', err.message);
-        return null;
-  }
+        return { top: null, candidates: [] };
+    }
 }
 
 // Searches for lodging businesses within radiusMeters of the given coordinates using
