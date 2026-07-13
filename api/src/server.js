@@ -525,27 +525,70 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
                          const hotel = hotelResult.rows[0];
 
             let lat = hotel.latitude !== null ? Number(hotel.latitude) : null;
-                         let lng = hotel.longitude !== null ? Number(hotel.longitude) : null;
-                         let locationSource = 'stored';
-
-            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-                            const resolved = await resolveHotelLocation(hotel);
-                            if (!resolved) {
-                                                return res.json({
-                                                                        status: 'location_unresolved',
-                                                                        message: 'Could not resolve this hotel\'s location via Google Places.'
-                                                });
-                            }
-                            lat = resolved.lat;
-                            lng = resolved.lng;
-                            locationSource = 'resolved_via_google_places';
-                            await pool.query(
-                                                'UPDATE hotels SET latitude = $1, longitude = $2, updated_at = now() WHERE id = $3',
-                                                [lat, lng, hotelId]
-                                            );
-            }
-
-            const MAX_RAW_CANDIDATES = 60;
+                 let lng = hotel.longitude !== null ? Number(hotel.longitude) : null;
+                 let locationSource = 'stored';
+                 let locationConfidence = hotel.location_confidence || null;
+                 
+                 if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+                     const resolved = await resolveHotelLocation(hotel);
+                     const top = resolved && resolved.top ? resolved.top : null;
+                     
+                     if (!top || top.confidence === 'low') {
+                         await pool.query(
+                             "UPDATE hotels SET location_confidence = 'low', updated_at = now() WHERE id = $1",
+                             [hotelId]
+                             );
+                         return res.json({
+                             status: 'location_needs_verification',
+                             message: 'Hotel location needs verification before competitive set discovery.',
+                             location_confidence: 'low',
+                             candidate_matches: (resolved ? resolved.candidates : []).map((c) => ({
+                                 place_id: c.place_id,
+                                 name: c.name,
+                                 formatted_address: c.formatted_address,
+                                 website: c.website,
+                                 lat: c.lat,
+                                 lng: c.lng,
+                                 confidence: c.confidence,
+                                 reasons: c.reasons
+                             }))
+                         });
+                     }
+                     
+                     lat = top.lat;
+                     lng = top.lng;
+                     locationSource = 'resolved_via_google_places';
+                     locationConfidence = top.confidence;
+                     
+                     await pool.query(
+                         `UPDATE hotels SET
+                         latitude = $1,
+                         longitude = $2,
+                         google_place_id = $3,
+                         address = COALESCE(address, $4),
+                         city = COALESCE(city, $5),
+                         country = COALESCE(country, $6),
+                         location_confidence = $7,
+                         updated_at = now()
+                         WHERE id = $8`,
+                         [
+                             lat,
+                             lng,
+                             top.place_id || null,
+                             top.formatted_address || null,
+                             top.city_component || null,
+                             top.country_component || null,
+                             locationConfidence,
+                             hotelId
+                             ]
+                         );
+                 } else if (locationSource === 'stored' && !locationConfidence) {
+                     // Pre-existing stored coordinates from before location verification was introduced.
+                     // Trusted as-is so we don't break hotels that were already working correctly.
+                     locationConfidence = 'high';
+                 }
+                 
+                 const MAX_RAW_CANDIDATES = 60;
                  const MAX_PRIMARY = 5;
                  const MAX_SECONDARY = 7;
                  const MAX_VISIBLE_TOTAL = 12;
@@ -596,6 +639,7 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
     res.json({
         hotel_id: Number(hotelId),
         location_source: locationSource,
+        location_confidence: locationConfidence,
         primary_competitors: primaryVisible,
         secondary_competitors: secondaryVisible,
         nearby_not_comparable: nearbyNotComparable,
@@ -638,6 +682,77 @@ app.get('/hotels/:id/competitors', async (req, res) => {
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
+    }
+});
+
+// PATCH /hotels/:id/profile - updates basic hotel profile fields (name/address/city/
+// country/phone). Generic and reusable - needed so a hotel's own city/country/address
+// context can be recorded and used by location resolution. Text fields only.
+app.patch('/hotels/:id/profile', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'Database not configured' });
+    const hotelId = req.params.id;
+    const { name, address, city, country, phone } = req.body || {};
+    
+    const fields = [];
+    const values = [];
+    let i = 1;
+    if (name !== undefined) { fields.push(`name = $${i++}`); values.push(name); }
+    if (address !== undefined) { fields.push(`address = $${i++}`); values.push(address); }
+    if (city !== undefined) { fields.push(`city = $${i++}`); values.push(city); }
+    if (country !== undefined) { fields.push(`country = $${i++}`); values.push(country); }
+    if (phone !== undefined) { fields.push(`phone = $${i++}`); values.push(phone); }
+    
+    if (!fields.length) {
+        return res.status(400).json({ error: 'No profile fields provided. Accepted fields: name, address, city, country, phone.' });
+    }
+    
+    try {
+        values.push(hotelId);
+        const result = await pool.query(
+            `UPDATE hotels SET ${fields.join(', ')}, updated_at = now() WHERE id = $${i} RETURNING *`,
+            values
+            );
+        if (!result.rows.length) return res.status(404).json({ error: 'Hotel not found' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update hotel profile', message: err.message });
+    }
+});
+
+// POST /hotels/:id/competitors/reset-location - clears a hotel's resolved location
+// (latitude/longitude/google_place_id/location_confidence) and deletes its previously
+// discovered google_places competitor rows. Generic/reusable for correcting any hotel
+// with bad geo data, not specific to any single property.
+app.post('/hotels/:id/competitors/reset-location', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'Database not configured' });
+    const hotelId = req.params.id;
+    
+    try {
+        const hotelResult = await pool.query(
+            `UPDATE hotels SET
+            latitude = NULL,
+            longitude = NULL,
+            google_place_id = NULL,
+            location_confidence = NULL,
+            updated_at = now()
+            WHERE id = $1
+            RETURNING *`,
+            [hotelId]
+            );
+        if (!hotelResult.rows.length) return res.status(404).json({ error: 'Hotel not found' });
+        
+        const deleted = await pool.query(
+            "DELETE FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' RETURNING id",
+            [hotelId]
+            );
+        
+        res.json({
+            hotel_id: Number(hotelId),
+            location_cleared: true,
+            competitors_deleted: deleted.rows.length
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to reset hotel location', message: err.message });
     }
 });
 
