@@ -545,60 +545,102 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
                                             );
             }
 
-            const candidates = await searchNearbyHotels(lat, lng, 20000);
-                         const classified = candidates.map((c) => classifyCompetitor(c, hotel, { lat, lng }));
+            const MAX_RAW_CANDIDATES = 60;
+                 const MAX_PRIMARY = 5;
+                 const MAX_SECONDARY = 7;
+                 const MAX_VISIBLE_TOTAL = 12;
 
-            await pool.query(
-                            "DELETE FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places'",
-                            [hotelId]
-                        );
+    const rawCandidates = (await searchNearbyHotels(lat, lng, 20000)).slice(0, MAX_RAW_CANDIDATES);
+                 const classified = rawCandidates.map((c) => classifyCompetitor(c, hotel, { lat, lng }));
 
-            for (const item of classified) {
-                            if (item.competitor_type === 'excluded') continue;
-                            await storeCompetitor({
-                                                hotelId,
-                                                name: item.name,
-                                                website: item.website || null,
-                                                city: hotel.city || null,
-                                                platformSource: 'google_places',
-                                                confidence: item.confidence,
-                                                distanceKm: item.distance_km,
-                                                rawData: item
-                            });
-            }
+    const byRank = (a, b) => {
+        if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+        const da = a.distance_km === null ? Infinity : a.distance_km;
+        const db = b.distance_km === null ? Infinity : b.distance_km;
+        return da - db;
+    };
 
-            res.json({
-                            hotel_id: Number(hotelId),
-                            location_source: locationSource,
-                            candidates_found: classified.length,
-                            primary_competitors: classified.filter((c) => c.competitor_type === 'primary_competitor').length,
-                            secondary_competitors: classified.filter((c) => c.competitor_type === 'secondary_competitor').length,
-                            nearby_not_comparable: classified.filter((c) => c.competitor_type === 'nearby_not_comparable').length,
-                            excluded: classified.filter((c) => c.competitor_type === 'excluded').length,
-                            results: classified
-            });
+    const primaryAll = classified.filter((c) => c.competitor_type === 'primary_competitor').sort(byRank);
+                 const secondaryAll = classified.filter((c) => c.competitor_type === 'secondary_competitor').sort(byRank);
+                 const nearbyNotComparable = classified.filter((c) => c.competitor_type === 'nearby_not_comparable').sort(byRank);
+                 const excludedList = classified.filter((c) => c.competitor_type === 'excluded');
+
+    const primaryVisible = primaryAll.slice(0, MAX_PRIMARY);
+                 let secondaryVisible = secondaryAll.slice(0, MAX_SECONDARY);
+                 if (primaryVisible.length + secondaryVisible.length > MAX_VISIBLE_TOTAL) {
+                     secondaryVisible = secondaryVisible.slice(0, Math.max(0, MAX_VISIBLE_TOTAL - primaryVisible.length));
+                 }
+
+    // Idempotent by design: replace this hotel's Google Places competitive set rather
+    // than appending, so repeated discover calls update instead of duplicating rows.
+    // Only useful candidates (primary/secondary) are persisted - nearby_not_comparable
+    // and excluded are returned in the response for transparency only, never stored.
+    await pool.query(
+        "DELETE FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places'",
+        [hotelId]
+        );
+
+    for (const item of [...primaryVisible, ...secondaryVisible]) {
+        await storeCompetitor({
+            hotelId,
+            name: item.name,
+            website: item.website || null,
+            city: hotel.city || null,
+            platformSource: 'google_places',
+            confidence: item.confidence,
+            distanceKm: item.distance_km,
+            rawData: item
+        });
+    }
+
+    res.json({
+        hotel_id: Number(hotelId),
+        location_source: locationSource,
+        primary_competitors: primaryVisible,
+        secondary_competitors: secondaryVisible,
+        nearby_not_comparable: nearbyNotComparable,
+        excluded: excludedList,
+        summary: {
+            raw_candidates_found: rawCandidates.length,
+            primary_count: primaryVisible.length,
+            secondary_count: secondaryVisible.length,
+            nearby_not_comparable_count: nearbyNotComparable.length,
+            excluded_count: excludedList.length
+        }
+    });
              } catch (err) {
-                         console.error('Competitor discovery error', err);
-                         res.status(500).json({ error: 'Failed to discover competitors', message: err.message });
+                 console.error('Competitor discovery error', err);
+                 res.status(500).json({ error: 'Failed to discover competitors', message: err.message });
              }
 });
 
-// GET /hotels/:id/competitors - cached Google Places competitor results for this hotel.
+// GET /hotels/:id/competitors - cached Google Places competitive set for this hotel.
 // Read-only; never makes a live API call. Call the /discover endpoint above to refresh.
+// Only primary/secondary competitors are ever persisted (excluded rows are never stored).
 app.get('/hotels/:id/competitors', async (req, res) => {
-        if (!pool) return res.status(503).json({ error: 'Database not configured' });
-        try {
-                    const result = await pool.query(
-                                    "SELECT id, name, website, city, platform_source, confidence, distance_km, raw_data, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' ORDER BY confidence DESC NULLS LAST, distance_km ASC NULLS LAST",
-                                    [req.params.id]
-                                );
-                    res.json({ hotel_id: Number(req.params.id), count: result.rows.length, competitors: result.rows });
-        } catch (err) {
-                    res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
-        }
+    if (!pool) return res.status(503).json({ error: 'Database not configured' });
+    try {
+        const result = await pool.query(
+            "SELECT id, name, website, city, platform_source, confidence, distance_km, raw_data, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' ORDER BY confidence DESC NULLS LAST, distance_km ASC NULLS LAST",
+            [req.params.id]
+            );
+        const rows = result.rows;
+        const primary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'primary_competitor');
+        const secondary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'secondary_competitor');
+        res.json({
+            hotel_id: Number(req.params.id),
+            primary_competitors: primary,
+            secondary_competitors: secondary,
+            summary: {
+                primary_count: primary.length,
+                secondary_count: secondary.length
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
+    }
 });
 
-
 app.listen(port, () => {
-        console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
+    console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
 });
