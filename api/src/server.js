@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
 import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, getTripadvisorApiMode, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
+import { getCompetitorsConnectorStatus, getGooglePlacesApiKey, resolveHotelLocation, searchNearbyHotels, classifyCompetitor } from './engines/googlePlaces.js';
 import {
     pool,
     normaliseDomain,
@@ -498,6 +499,106 @@ app.get('/hotels/:id/revenue', async (req, res) => {
       }
 });
 
+// GET /competitors/status - Google Places (New) competitor discovery connector status.
+// Server-side key only, never exposed to the client. No OAuth/login involved.
+app.get('/competitors/status', (req, res) => {
+        res.json(getCompetitorsConnectorStatus());
+});
+
+// POST /hotels/:id/competitors/discover - finds potential hotel competitors within
+// 20km of the hotel using Google Places API (New). Scores and classifies each result
+// instead of returning every nearby hotel as a competitor.
+app.post('/hotels/:id/competitors/discover', async (req, res) => {
+        if (!pool) return res.status(503).json({ error: 'Database not configured' });
+        const hotelId = req.params.id;
+
+             if (!getGooglePlacesApiKey()) {
+                         return res.json({
+                                         status: 'not_configured',
+                                         message: 'Google Places competitor discovery is not configured yet.'
+                         });
+             }
+
+             try {
+                         const hotelResult = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+                         if (!hotelResult.rows.length) return res.status(404).json({ error: 'Hotel not found' });
+                         const hotel = hotelResult.rows[0];
+
+            let lat = hotel.latitude !== null ? Number(hotel.latitude) : null;
+                         let lng = hotel.longitude !== null ? Number(hotel.longitude) : null;
+                         let locationSource = 'stored';
+
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+                            const resolved = await resolveHotelLocation(hotel);
+                            if (!resolved) {
+                                                return res.json({
+                                                                        status: 'location_unresolved',
+                                                                        message: 'Could not resolve this hotel\'s location via Google Places.'
+                                                });
+                            }
+                            lat = resolved.lat;
+                            lng = resolved.lng;
+                            locationSource = 'resolved_via_google_places';
+                            await pool.query(
+                                                'UPDATE hotels SET latitude = $1, longitude = $2, updated_at = now() WHERE id = $3',
+                                                [lat, lng, hotelId]
+                                            );
+            }
+
+            const candidates = await searchNearbyHotels(lat, lng, 20000);
+                         const classified = candidates.map((c) => classifyCompetitor(c, hotel, { lat, lng }));
+
+            await pool.query(
+                            "DELETE FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places'",
+                            [hotelId]
+                        );
+
+            for (const item of classified) {
+                            if (item.competitor_type === 'excluded') continue;
+                            await storeCompetitor({
+                                                hotelId,
+                                                name: item.name,
+                                                website: item.website || null,
+                                                city: hotel.city || null,
+                                                platformSource: 'google_places',
+                                                confidence: item.confidence,
+                                                distanceKm: item.distance_km,
+                                                rawData: item
+                            });
+            }
+
+            res.json({
+                            hotel_id: Number(hotelId),
+                            location_source: locationSource,
+                            candidates_found: classified.length,
+                            primary_competitors: classified.filter((c) => c.competitor_type === 'primary_competitor').length,
+                            secondary_competitors: classified.filter((c) => c.competitor_type === 'secondary_competitor').length,
+                            nearby_not_comparable: classified.filter((c) => c.competitor_type === 'nearby_not_comparable').length,
+                            excluded: classified.filter((c) => c.competitor_type === 'excluded').length,
+                            results: classified
+            });
+             } catch (err) {
+                         console.error('Competitor discovery error', err);
+                         res.status(500).json({ error: 'Failed to discover competitors', message: err.message });
+             }
+});
+
+// GET /hotels/:id/competitors - cached Google Places competitor results for this hotel.
+// Read-only; never makes a live API call. Call the /discover endpoint above to refresh.
+app.get('/hotels/:id/competitors', async (req, res) => {
+        if (!pool) return res.status(503).json({ error: 'Database not configured' });
+        try {
+                    const result = await pool.query(
+                                    "SELECT id, name, website, city, platform_source, confidence, distance_km, raw_data, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' ORDER BY confidence DESC NULLS LAST, distance_km ASC NULLS LAST",
+                                    [req.params.id]
+                                );
+                    res.json({ hotel_id: Number(req.params.id), count: result.rows.length, competitors: result.rows });
+        } catch (err) {
+                    res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
+        }
+});
+
+
 app.listen(port, () => {
-    console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
+        console.log(`Polaris Revenue Intelligence API v3.3 running on ${port}`);
 });
