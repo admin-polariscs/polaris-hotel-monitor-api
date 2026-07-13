@@ -288,7 +288,8 @@ app.get('/hotels/:id/discovery', async (req, res) => {
             }
       
             res.json({ discoveredListings, competitors: comps.rows, otaEvidence });
-      catch (err) {
+  }
+  catch (err) {
     res.status(500).json({ error: 'Failed to fetch discovery data', message: err.message });
   }
 });
