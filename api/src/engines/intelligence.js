@@ -350,4 +350,4 @@ const ws=websiteSignals($,meta.html,meta);
 entity=await refineEntityWithAi(entity,ws);
 const ps=await pagespeed(meta.finalUrl); const scores=score(ws,ps); const revenueLeaks=leaks(ws,ps,entity); const otas=discoverOtas(entity); const competitors=discoverCompetitors(entity);
 return {scanId:crypto.randomUUID(),generatedAt:new Date().toISOString(),inputUrl:url,finalUrl:meta.finalUrl,entity,scores,website:ws,performance:ps,ota:{status:'automatic-discovery-v1',items:otas},reviews:{status:'prepared',note:'Google/Booking/Tripadvisor review engines are ready for API-based integration. No manual review fields are used.'},competitors,aiVisibility:{status:'prepared',queries:[`best hotels ${entity.city||''}`,`business hotel ${entity.city||''}`,`${entity.name} hotel review`,`direct booking ${entity.name}`]},revenueLeaks,consultant:aiConsultant(entity,ws,scores,revenueLeaks),ota_evidence:buildOtaEvidence(entity,otas)};
-}}
+}
