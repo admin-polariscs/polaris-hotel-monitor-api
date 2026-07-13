@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
-import { runHotelIntelligence } from './engines/intelligence.js';
+import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
+import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, getTripadvisorApiMode, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
 import {
     pool,
     normaliseDomain,
@@ -77,7 +78,9 @@ function buildSections(result) {
       },
       { section: 'competitors', score: null, summary: null, data: result.competitors },
       { section: 'revenue_leaks', score: null, summary: null, data: result.revenueLeaks },
-      { section: 'consultant', score: null, summary: result.consultant ? result.consultant.headline : null, data: result.consultant }
+      { section: 'consultant', score: null, summary: result.consultant ? result.consultant.headline : null, data: result.consultant },
+        { section: 'ota_evidence', score: null, summary: null, data: result.ota_evidence },
+        { section: 'revenue_value', score: result.revenue_value ? result.revenue_value.revenue_opportunity_score : null, summary: result.revenue_value ? result.revenue_value.management_summary : null, data: result.revenue_value }
         ];
 }
 
@@ -123,6 +126,33 @@ if (result.competitors && Array.isArray(result.competitors.items)) {
   await completeScan(scanRecord.id);
 }
 
+// Avoids re-hitting the official API on every request/page refresh. A sync within this
+// window returns the cached row instead of calling Tripadvisor again, unless force=true.
+const TRIPADVISOR_SYNC_MIN_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
+
+// Reflects the latest CACHED Tripadvisor connector state (from tripadvisor_connections)
+// onto the Tripadvisor ota_evidence entry. No live Tripadvisor API call is made here - this
+// only reads cached connector state, so it never consumes Tripadvisor quota or scrapes.
+async function applyTripadvisorStatusToOtaEvidence(otaEvidence, hotelId) {
+      const tripEntryIndex = Array.isArray(otaEvidence) ? otaEvidence.findIndex((e) => e.platform === 'Tripadvisor') : -1;
+      if (tripEntryIndex === -1) return otaEvidence;
+    
+      if (!pool || !hotelId) return otaEvidence;
+    
+      try {
+              const row = await pool.query(
+                        'SELECT * FROM tripadvisor_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1',
+                        [hotelId]
+                      );
+              if (!row.rows.length) return otaEvidence;
+              const built = buildTripadvisorOtaEvidenceEntry(row.rows[0]);
+              if (built) otaEvidence[tripEntryIndex] = built;
+      } catch (err) {
+              console.error('Failed to check Tripadvisor connector status for ota_evidence:', err.message);
+      }
+      return otaEvidence;
+}
+
 app.post('/scan', async (req, res) => {
     const { url } = req.body || {};
     if (!url) return res.status(400).json({ error: 'Missing url' });
@@ -144,6 +174,16 @@ app.post('/scan', async (req, res) => {
 
            try {
                  const result = await runHotelIntelligence(url);
+
+                     await applyTripadvisorStatusToOtaEvidence(result.ota_evidence, hotelRecord ? hotelRecord.id : null);
+                     result.revenue_value = computeRevenueValue({
+                                 entity: result.entity,
+                                 website: result.website,
+                                 performance: result.performance,
+                                 scores: result.scores,
+                                 revenueLeaks: result.revenueLeaks,
+                                 otaEvidence: result.ota_evidence
+                     });
 
       if (pool && scanRecord && hotelRecord) {
               try {
@@ -231,10 +271,230 @@ app.get('/hotels/:id/discovery', async (req, res) => {
         : `${row.platform} discovery candidate prepared`;
       return { ...row, message };
     });
-    res.json({ discoveredListings, competitors: comps.rows });
-  } catch (err) {
+          // Also surface the latest structured ota_evidence for this hotel (customer-safe
+            // wording, revenue relevance and next actions per platform), from the most recent scan.
+            let otaEvidence = [];
+            try {
+                        const otaEvidenceResult = await pool.query(
+                                      `SELECT sr.data FROM scan_results sr
+                                                 JOIN scans s ON s.id = sr.scan_id
+                                                            WHERE s.hotel_id = $1 AND sr.section = 'ota_evidence'
+                                                                       ORDER BY sr.id DESC LIMIT 1`,
+                                      [req.params.id]
+                                    );
+                        otaEvidence = otaEvidenceResult.rows.length ? otaEvidenceResult.rows[0].data : [];
+            } catch (otaErr) {
+                        console.error('Failed to fetch latest ota_evidence:', otaErr.message);
+            }
+      
+            res.json({ discoveredListings, competitors: comps.rows, otaEvidence });
+      catch (err) {
     res.status(500).json({ error: 'Failed to fetch discovery data', message: err.message });
   }
+});
+
+// Tripadvisor Reputation Signal - official API only (Terra by default, legacy Content API
+// as a fallback). Limited recent-review and reputation alert source, not full review
+// intelligence. Never scrapes Tripadvisor.
+app.get('/tripadvisor/status', (req, res) => {
+      res.json(getTripadvisorConnectorStatus());
+});
+
+function formatTripadvisorRow(row, source, messageOverride, wordingOverride) {
+      const isTerra = row.api_mode === 'terra';
+      const defaultLimitedMessage = isTerra
+              ? 'Tripadvisor Terra data is available as a limited reputation signal.'
+              : 'Tripadvisor data is available as a limited reputation signal.';
+      return {
+              status: row.status,
+              api_mode: row.api_mode || null,
+              message: messageOverride || (row.status === TRIPADVISOR_STATUS.LIMITED_DATA_AVAILABLE
+                                                 ? defaultLimitedMessage
+                                                 : 'Tripadvisor connector not configured yet.'),
+              wording: wordingOverride || 'Tripadvisor Reputation Signal uses limited recent review data available through the official API.',
+              location_id: row.location_id,
+              profile_url: row.profile_url,
+              rating: row.rating,
+              review_count: row.review_count,
+              confidence: row.confidence,
+              verified: row.verified,
+              limited_recent_reviews: row.limited_recent_reviews || [],
+              negative_review_detected: row.negative_review_detected,
+              urgent_negative_detected: row.urgent_negative_detected,
+              sentiment_summary: row.sentiment_summary,
+              recommended_action: row.recommended_action,
+              last_synced_at: row.last_synced_at,
+              raw_data: row.raw_data,
+              source
+      };
+}
+
+// GET /hotels/:id/tripadvisor - read-only. Returns the cached Tripadvisor Reputation Signal.
+// Never calls the live Tripadvisor API - call POST /hotels/:id/tripadvisor/sync to refresh it.
+app.get('/hotels/:id/tripadvisor', async (req, res) => {
+      if (!pool) return res.status(503).json({ error: 'Database not configured' });
+      const hotelId = req.params.id;
+    
+      if (!getTripadvisorApiKey()) {
+              return res.json({
+                        status: TRIPADVISOR_STATUS.API_KEY_MISSING,
+                        message: 'Tripadvisor connector not configured yet.',
+                        wording: 'Tripadvisor Reputation Signal uses limited recent review data available through the official API.',
+                        location_id: null,
+                        profile_url: null,
+                        rating: null,
+                        review_count: null,
+                        confidence: null,
+                        verified: false,
+                        limited_recent_reviews: [],
+                        negative_review_detected: false,
+                        urgent_negative_detected: false,
+                        sentiment_summary: null,
+                        recommended_action: null,
+                        last_synced_at: null,
+                        raw_data: null
+              });
+      }
+    
+      try {
+              const existing = await pool.query(
+                        'SELECT * FROM tripadvisor_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1',
+                        [hotelId]
+                      );
+              if (!existing.rows.length) {
+                        return res.json({
+                                    status: TRIPADVISOR_STATUS.NOT_CONFIGURED,
+                                    message: 'No Tripadvisor sync has been run yet for this hotel. Call POST /hotels/:id/tripadvisor/sync first.',
+                                    wording: 'Tripadvisor Reputation Signal uses limited recent review data available through the official API.',
+                                    location_id: null,
+                                    profile_url: null,
+                                    rating: null,
+                                    review_count: null,
+                                    confidence: null,
+                                    verified: false,
+                                    limited_recent_reviews: [],
+                                    negative_review_detected: false,
+                                    urgent_negative_detected: false,
+                                    sentiment_summary: null,
+                                    recommended_action: null,
+                                    last_synced_at: null,
+                                    raw_data: null
+                        });
+              }
+          
+              res.json(formatTripadvisorRow(existing.rows[0], 'cache'));
+      } catch (err) {
+              console.error('Failed to fetch Tripadvisor data:', err.message);
+              res.status(500).json({ status: TRIPADVISOR_STATUS.ERROR, error: 'Failed to fetch Tripadvisor data', message: err.message });
+      }
+});
+
+// POST /hotels/:id/tripadvisor/sync - the only route that calls the official Tripadvisor
+// API. Finds the hotel via name/city/address/phone/website where available, picks the
+// best candidate conservatively, fetches details + limited recent reviews, classifies them,
+// and caches the result. Never scrapes Tripadvisor. Never fabricates reviews.
+app.post('/hotels/:id/tripadvisor/sync', async (req, res) => {
+      if (!pool) return res.status(503).json({ error: 'Database not configured' });
+      const hotelId = req.params.id;
+    
+      if (!getTripadvisorApiKey()) {
+              return res.json({
+                        status: TRIPADVISOR_STATUS.API_KEY_MISSING,
+                        message: 'Tripadvisor connector not configured yet.',
+                        wording: 'Tripadvisor Reputation Signal uses limited recent review data available through the official API.'
+              });
+      }
+    
+      try {
+              const hotelResult = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+              if (!hotelResult.rows.length) return res.status(404).json({ error: 'Hotel not found' });
+              const hotel = hotelResult.rows[0];
+          
+              const existing = await pool.query(
+                        'SELECT * FROM tripadvisor_connections WHERE hotel_id = $1 ORDER BY id DESC LIMIT 1',
+                        [hotelId]
+                      );
+              const force = (req.query && req.query.force === 'true') || (req.body && req.body.force === true);
+              if (!force && existing.rows.length && existing.rows[0].last_synced_at) {
+                        const ageMs = Date.now() - new Date(existing.rows[0].last_synced_at).getTime();
+                        if (ageMs < TRIPADVISOR_SYNC_MIN_INTERVAL_MS) {
+                                    return res.json(formatTripadvisorRow(existing.rows[0], 'cache'));
+                        }
+              }
+          
+              const entity = {
+                        name: hotel.name,
+                        city: hotel.city || null,
+                        address: hotel.address || null,
+                        phone: hotel.phone || null,
+                        domain: hotel.domain || null,
+                        website: hotel.website || null
+              };
+              const data = await fetchTripadvisorData(entity);
+          
+              const insertResult = await pool.query(
+                        `INSERT INTO tripadvisor_connections
+                                (hotel_id, location_id, profile_url, rating, review_count, photos_count, confidence, verified,
+                                         limited_recent_reviews, sentiment_summary, negative_review_detected, urgent_negative_detected,
+                                                  recommended_response_needed, recommended_action, status, raw_data, api_mode, last_synced_at, updated_at)
+                                                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now(), now())
+                                                                  RETURNING *`,
+                        [
+                                    hotelId,
+                                    data.location_id,
+                                    data.profile_url,
+                                    data.rating,
+                                    data.review_count,
+                                    data.photos_count,
+                                    data.confidence,
+                                    !!data.verified,
+                                    JSON.stringify(data.limited_recent_reviews || []),
+                                    JSON.stringify(data.sentiment_summary || null),
+                                    !!data.negative_review_detected,
+                                    !!data.urgent_negative_detected,
+                                    !!data.recommended_response_needed,
+                                    data.recommended_action || null,
+                                    data.status,
+                                    JSON.stringify(data.raw_data || null),
+                                    data.api_mode || getTripadvisorApiMode()
+                                  ]
+                      );
+          
+              res.json(formatTripadvisorRow(insertResult.rows[0], 'live', data.message, data.wording));
+      } catch (err) {
+              console.error('Failed to sync Tripadvisor data:', err.message);
+              res.status(500).json({ status: TRIPADVISOR_STATUS.ERROR, error: 'Failed to sync Tripadvisor data', message: err.message });
+      }
+});
+
+// GET /hotels/:id/revenue - latest revenue_value layer for this hotel (from the most
+// recent completed scan). Read-only; does not trigger a new scan or any external API call.
+app.get('/hotels/:id/revenue', async (req, res) => {
+      if (!pool) return res.status(503).json({ error: 'Database not configured' });
+      try {
+              const result = await pool.query(
+                        `SELECT sr.data, s.id as scan_id, s.completed_at, s.started_at
+                               FROM scan_results sr
+                                      JOIN scans s ON s.id = sr.scan_id
+                                             WHERE s.hotel_id = $1 AND sr.section = 'revenue_value'
+                                                    ORDER BY sr.id DESC LIMIT 1`,
+                        [req.params.id]
+                      );
+              if (!result.rows.length) {
+                        return res.status(404).json({
+                                    error: 'No revenue value data found for this hotel yet',
+                                    message: 'Run a scan first via POST /scan.'
+                        });
+              }
+              const row = result.rows[0];
+              res.json({
+                        scanId: row.scan_id,
+                        generatedAt: row.completed_at || row.started_at,
+                        revenue_value: row.data
+              });
+      } catch (err) {
+              res.status(500).json({ error: 'Failed to fetch revenue value', message: err.message });
+      }
 });
 
 app.listen(port, () => {
