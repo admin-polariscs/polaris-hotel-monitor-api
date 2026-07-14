@@ -15,8 +15,13 @@ import {
         exchangeForLongLivedToken,
         fetchMetaUser,
         fetchFacebookPages,
-        META_SCOPES
+fetchFacebookPagesWithTokens,
+        	fetchFacebookPagePosts,
+        	fetchInstagramProfile,
+        	fetchInstagramMedia,
+        	META_SCOPES
 } from './engines/metaSocial.js';
+import { computeActivityMetrics, instagramStatus, facebookStatus, recommendedAction, alertForProvider } from './engines/socialActivity.js';
 import {
     pool,
     normaliseDomain,
@@ -30,7 +35,10 @@ import {
         upsertMetaConnection,
         getMetaConnectionByHotelId,
         upsertSocialProfile,
-        getSocialProfilesByHotelId
+        getSocialProfilesByHotelId,
+        	upsertSocialPost,
+        	insertSocialActivitySnapshot,
+        	getRecentSocialActivitySnapshots,
 } from './db.js';
 
 const app = express();
@@ -918,126 +926,356 @@ app.get('/oauth/meta/callback', async (req, res) => {
         }
 });
 
+// --- Social Activity Monitor (v3.14) helpers -----------------------------------
+// Normalizes a raw Facebook Page post into the shape computeActivityMetrics expects.
+function normalizeFacebookPost(post) {
+        const reactions = post.reactions && post.reactions.summary ? post.reactions.summary.total_count : null;
+        const comments = post.comments && post.comments.summary ? post.comments.summary.total_count : null;
+        const shares = post.shares ? post.shares.count : null;
+        return {
+                id: post.id,
+                date: post.created_time ? new Date(post.created_time) : null,
+                likeCount: reactions || 0,
+                commentCount: comments || 0,
+                shareCount: shares || 0,
+                url: post.permalink_url || null,
+                mediaType: 'post',
+                captionPreview: post.message ? String(post.message).slice(0, 140) : null
+        };
+}
+
+// Normalizes a raw Instagram media item into the shape computeActivityMetrics expects.
+function normalizeInstagramMedia(media) {
+        return {
+                id: media.id,
+                date: media.timestamp ? new Date(media.timestamp) : null,
+                likeCount: media.like_count || 0,
+                commentCount: media.comments_count || 0,
+                shareCount: 0,
+                url: media.permalink || null,
+                mediaType: media.media_type || null,
+                captionPreview: media.caption ? String(media.caption).slice(0, 140) : null
+        };
+}
+
+// Persists normalized posts idempotently and returns the computed metrics/status
+// for one provider. Never throws - permission/API errors are caught by the caller.
+async function syncProviderActivity({ hotelId, provider, profileId, profileName, profileUrl, followersCount, pageLikesCount, posts }) {
+        for (const post of posts) {
+                if (!post.id) continue;
+                await upsertSocialPost({
+                        hotelId,
+                        provider,
+                        providerPostId: String(post.id),
+                        postUrl: post.url,
+                        postDate: post.date,
+                        messagePreview: post.captionPreview,
+                        mediaType: post.mediaType,
+                        likeCount: post.likeCount,
+                        commentCount: post.commentCount,
+                        shareCount: post.shareCount,
+                        rawData: { id: post.id }
+                });
+        }
+        
+        const metrics = computeActivityMetrics(posts);
+        const status = provider === 'instagram' ? instagramStatus(metrics) : facebookStatus(metrics);
+        const action = recommendedAction(provider, status);
+        
+        const snapshot = await insertSocialActivitySnapshot({
+                hotelId,
+                provider,
+                profileId,
+                profileName,
+                profileUrl,
+                followersCount,
+                pageLikesCount,
+                postsLast7Days: metrics.posts_last_7_days,
+                postsLast14Days: metrics.posts_last_14_days,
+                postsLast30Days: metrics.posts_last_30_days,
+                likesLast30Days: metrics.likes_last_30_days,
+                commentsLast30Days: metrics.comments_last_30_days,
+                avgLikesPerPost30Days: metrics.avg_likes_per_post_30_days,
+                avgCommentsPerPost30Days: metrics.avg_comments_per_post_30_days,
+                lastPostDate: metrics.last_post_date,
+                daysSinceLastPost: metrics.days_since_last_post,
+                bestPostUrl: metrics.best_post_url,
+                bestPostLikes: metrics.best_post_likes,
+                status,
+                recommendedAction: action,
+                rawData: null
+        });
+        
+        return snapshot;
+}
+
+// Builds the customer-safe detail block for one provider from its latest snapshot.
+// monitoring_active is only ever true when a snapshot with real post data exists.
+function buildProviderDetail(provider, profileFromDb, snapshots) {
+        const latest = snapshots && snapshots.length ? snapshots[0] : null;
+        const monitoringActive = !!(latest && ['ok', 'warning', 'critical'].includes(latest.status));
+        
+        if (!monitoringActive) {
+                return {
+                        profile_found: !!profileFromDb,
+                        monitoring_active: false,
+                        profile_url: profileFromDb ? profileFromDb.profile_url : null,
+                        status: latest ? latest.status : 'access_needed'
+                };
+        }
+        
+        return {
+                profile_found: true,
+                monitoring_active: true,
+                profile_url: latest.profile_url,
+                followers_count: latest.followers_count !== null ? Number(latest.followers_count) : null,
+                last_post_date: latest.last_post_date,
+                days_since_last_post: latest.days_since_last_post,
+                posts_last_14_days: latest.posts_last_14_days,
+                posts_last_30_days: latest.posts_last_30_days,
+                likes_last_30_days: latest.likes_last_30_days,
+                avg_likes_per_post_30_days: latest.avg_likes_per_post_30_days !== null ? Number(latest.avg_likes_per_post_30_days) : null,
+                comments_last_30_days: latest.comments_last_30_days,
+                status: latest.status,
+                recommended_action: latest.recommended_action
+        };
+}
+
+function buildTrend(igSnapshots, fbSnapshots) {
+        function totals(snapshots) {
+                const latest = snapshots && snapshots.length ? snapshots[0] : null;
+                if (!latest || !['ok', 'warning', 'critical'].includes(latest.status)) return null;
+                return {
+                        followers: latest.followers_count !== null ? Number(latest.followers_count) : 0,
+                        avgLikes: latest.avg_likes_per_post_30_days !== null ? Number(latest.avg_likes_per_post_30_days) : 0,
+                        posts30: latest.posts_last_30_days || 0
+                };
+        }
+        function previousTotals(snapshots) {
+                const previous = snapshots && snapshots.length > 1 ? snapshots[1] : null;
+                if (!previous || !['ok', 'warning', 'critical'].includes(previous.status)) return null;
+                return {
+                        followers: previous.followers_count !== null ? Number(previous.followers_count) : 0,
+                        avgLikes: previous.avg_likes_per_post_30_days !== null ? Number(previous.avg_likes_per_post_30_days) : 0,
+                        posts30: previous.posts_last_30_days || 0
+                };
+        }
+        
+        const currentIg = totals(igSnapshots);
+        const currentFb = totals(fbSnapshots);
+        const previousIg = previousTotals(igSnapshots);
+        const previousFb = previousTotals(fbSnapshots);
+        
+        if ((!currentIg && !currentFb) || (!previousIg && !previousFb)) return null;
+        
+        const currentFollowers = (currentIg ? currentIg.followers : 0) + (currentFb ? currentFb.followers : 0);
+        const previousFollowers = (previousIg ? previousIg.followers : 0) + (previousFb ? previousFb.followers : 0);
+        const currentPosts = (currentIg ? currentIg.posts30 : 0) + (currentFb ? currentFb.posts30 : 0);
+        const previousPosts = (previousIg ? previousIg.posts30 : 0) + (previousFb ? previousFb.posts30 : 0);
+        
+        const currentAvgLikesValues = [currentIg, currentFb].filter(Boolean).map((v) => v.avgLikes);
+        const previousAvgLikesValues = [previousIg, previousFb].filter(Boolean).map((v) => v.avgLikes);
+        const currentAvgLikes = currentAvgLikesValues.length ? currentAvgLikesValues.reduce((a, b) => a + b, 0) / currentAvgLikesValues.length : 0;
+        const previousAvgLikes = previousAvgLikesValues.length ? previousAvgLikesValues.reduce((a, b) => a + b, 0) / previousAvgLikesValues.length : 0;
+        
+        return {
+                followers_delta_since_previous_scan: currentFollowers - previousFollowers,
+                avg_likes_delta_since_previous_scan: Math.round((currentAvgLikes - previousAvgLikes) * 10) / 10,
+                posting_frequency_delta: currentPosts - previousPosts
+        };
+}
+
 // GET /hotels/:id/social - customer-safe connection/monitoring status for a hotel.
 // Never returns tokens, scopes, or raw Graph API data.
 app.get('/hotels/:id/social', async (req, res) => {
         if (!pool) return res.status(503).json({ error: 'Database not configured' });
         const hotelId = req.params.id;
-    
+        
         try {
-                    const connection = await getMetaConnectionByHotelId(hotelId);
-                    const profiles = await getSocialProfilesByHotelId(hotelId);
-            
-                    if (!connection || connection.status !== 'connected') {
-                                    return res.json({
-                                                        status: 'access_needed',
-                                                        instagram: { profile_found: false, profile_url: null, monitoring_active: false },
-                                                        facebook: { profile_found: false, profile_url: null, monitoring_active: false },
-                                                        message: 'Meta access needed'
-                                    });
-                    }
-            
-                    const facebookProfile = profiles.find((p) => p.provider === 'facebook') || null;
-                    const instagramProfile = profiles.find((p) => p.provider === 'instagram') || null;
-            
-                    res.json({
-                                    status: connection.status === 'connected' ? 'connected' : (connection.status || 'error'),
-                                    instagram: {
-                                                        profile_found: !!instagramProfile,
-                                                        profile_url: instagramProfile ? instagramProfile.profile_url : null,
-                                                        monitoring_active: false
-                                    },
-                                    facebook: {
-                                                        profile_found: !!facebookProfile,
-                                                        profile_url: facebookProfile ? facebookProfile.profile_url : null,
-                                                        monitoring_active: false
-                                    },
-                                    message: 'Meta connected'
-                    });
+                const connection = await getMetaConnectionByHotelId(hotelId);
+                const profiles = await getSocialProfilesByHotelId(hotelId);
+                
+                if (!connection || connection.status !== 'connected') {
+                        return res.json({
+                                status: 'access_needed',
+                                instagram: { profile_found: false, profile_url: null, monitoring_active: false },
+                                facebook: { profile_found: false, profile_url: null, monitoring_active: false },
+                                message: 'Meta access needed'
+                        });
+                }
+                
+                const facebookProfile = profiles.find((p) => p.provider === 'facebook') || null;
+                const instagramProfile = profiles.find((p) => p.provider === 'instagram') || null;
+                
+                const igSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'instagram', 2);
+                const fbSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'facebook', 2);
+                
+                const instagram = buildProviderDetail('instagram', instagramProfile, igSnapshots);
+                const facebook = buildProviderDetail('facebook', facebookProfile, fbSnapshots);
+                
+                const alerts = [alertForProvider('instagram', instagram.status), alertForProvider('facebook', facebook.status)].filter(Boolean);
+                const trend = buildTrend(igSnapshots, fbSnapshots);
+                
+                res.json({
+                        status: 'connected',
+                        instagram,
+                        facebook,
+                        alerts,
+                        trend: trend || undefined,
+                        message: 'Meta connected'
+                });
         } catch (err) {
-                    res.status(500).json({ error: 'Failed to fetch social status', message: err.message });
+                res.status(500).json({ error: 'Failed to fetch social status', message: err.message });
         }
 });
 
-// POST /hotels/:id/social/sync - for now: lists the Facebook Pages (and any linked
-// Instagram Business accounts) visible to the connected Meta user, and stores them
-// as social_profiles. Never fails the whole dashboard on a permissions problem -
-// degrades gracefully and reports back what could and couldn't be read.
+// POST /hotels/:id/social/sync - retrieves real Instagram/Facebook activity via the
+// official Graph API where permissions allow, stores posts + a snapshot per
+// provider, and never fails the whole dashboard on a permissions problem.
 app.post('/hotels/:id/social/sync', async (req, res) => {
         if (!pool) return res.status(503).json({ error: 'Database not configured' });
         const hotelId = req.params.id;
-    
+        
         try {
-                    const connection = await getMetaConnectionByHotelId(hotelId);
-                    if (!connection || connection.status !== 'connected' || !connection.access_token) {
-                                    return res.json({ status: 'access_needed', message: 'Meta access needed' });
-                    }
-            
-                    const accessToken = decryptToken(connection.access_token);
-                    if (!accessToken) {
-                                    return res.json({ status: 'access_needed', message: 'Meta access needed' });
-                    }
-            
-                    let pages = [];
-                    try {
-                                    pages = await fetchFacebookPages(accessToken);
-                    } catch (graphErr) {
-                                    console.error('Meta sync error (fetchFacebookPages)', graphErr.message);
-                                    return res.json({
-                                                        status: 'error',
-                                                        message: 'Social partner follow-up needed',
-                                                        instagram: { profile_found: false, profile_url: null, monitoring_active: false },
-                                                        facebook: { profile_found: false, profile_url: null, monitoring_active: false }
-                                    });
-                    }
-            
-                    let facebookFound = false;
-                    let instagramFound = false;
-                    let facebookUrl = null;
-                    let instagramUrl = null;
-            
-                    for (const page of pages) {
-                                    facebookFound = true;
-                                    facebookUrl = page.link || null;
-                                    await upsertSocialProfile({
-                                                        hotelId,
-                                                        provider: 'facebook',
-                                                        profileName: page.name || null,
-                                                        profileUrl: page.link || null,
-                                                        providerAccountId: page.id,
-                                                        facebookPageId: page.id,
-                                                        status: 'active',
-                                                        rawData: { page_id: page.id, page_name: page.name || null }
-                                    });
+                const connection = await getMetaConnectionByHotelId(hotelId);
+                if (!connection || connection.status !== 'connected' || !connection.access_token) {
+                        return res.json({ status: 'access_needed', message: 'Meta access needed' });
+                }
+                
+                const accessToken = decryptToken(connection.access_token);
+                if (!accessToken) {
+                        return res.json({ status: 'access_needed', message: 'Meta access needed' });
+                }
+                
+                let pages = [];
+                try {
+                        pages = await fetchFacebookPagesWithTokens(accessToken);
+                } catch (graphErr) {
+                        console.error('Meta sync error (fetchFacebookPagesWithTokens)', graphErr.message);
+                        return res.json({
+                                status: 'error',
+                                message: 'Social partner follow-up needed',
+                                instagram: { profile_found: false, profile_url: null, monitoring_active: false },
+                                facebook: { profile_found: false, profile_url: null, monitoring_active: false }
+                        });
+                }
+                
+                const primaryPage = pages.length ? pages[0] : null;
+                
+                if (primaryPage) {
+                        await upsertSocialProfile({
+                                hotelId,
+                                provider: 'facebook',
+                                profileName: primaryPage.name || null,
+                                profileUrl: primaryPage.link || null,
+                                providerAccountId: primaryPage.id,
+                                facebookPageId: primaryPage.id,
+                                status: 'active',
+                                rawData: { page_id: primaryPage.id, page_name: primaryPage.name || null }
+                        });
                         
-                                    if (page.instagram_business_account && page.instagram_business_account.id) {
-                                                        instagramFound = true;
-                                                        const igUsername = page.instagram_business_account.username || null;
-                                                        instagramUrl = igUsername ? `https://www.instagram.com/${igUsername}/` : null;
-                                                        await upsertSocialProfile({
-                                                                                hotelId,
-                                                                                provider: 'instagram',
-                                                                                profileName: page.instagram_business_account.name || igUsername || null,
-                                                                                profileUrl: instagramUrl,
-                                                                                providerAccountId: page.instagram_business_account.id,
-                                                                                facebookPageId: page.id,
-                                                                                instagramBusinessAccountId: page.instagram_business_account.id,
-                                                                                status: 'active',
-                                                                                rawData: { username: igUsername }
-                                                        });
-                                    }
-                    }
-            
-                    res.json({
-                                    status: 'connected',
-                                    instagram: { profile_found: instagramFound, profile_url: instagramUrl, monitoring_active: false },
-                                    facebook: { profile_found: facebookFound, profile_url: facebookUrl, monitoring_active: false },
-                                    message: 'Meta connected',
-                                    pages_visible: pages.length
-                    });
+                        const pageToken = primaryPage.access_token || accessToken;
+                        
+                        try {
+                                const rawPosts = await fetchFacebookPagePosts(primaryPage.id, pageToken);
+                                const posts = rawPosts.map(normalizeFacebookPost);
+                                await syncProviderActivity({
+                                        hotelId,
+                                        provider: 'facebook',
+                                        profileId: primaryPage.id,
+                                        profileName: primaryPage.name || null,
+                                        profileUrl: primaryPage.link || null,
+                                        followersCount: null,
+                                        pageLikesCount: primaryPage.fan_count || primaryPage.followers_count || null,
+                                        posts
+                                });
+                        } catch (fbPostsErr) {
+                                console.error('Meta sync error (fetchFacebookPagePosts)', fbPostsErr.message);
+                                await insertSocialActivitySnapshot({
+                                        hotelId,
+                                        provider: 'facebook',
+                                        profileId: primaryPage.id,
+                                        profileName: primaryPage.name || null,
+                                        profileUrl: primaryPage.link || null,
+                                        status: 'permission_needed',
+                                        recommendedAction: recommendedAction('facebook', 'permission_needed')
+                                });
+                        }
+                        
+                        if (primaryPage.instagram_business_account && primaryPage.instagram_business_account.id) {
+                                const igId = primaryPage.instagram_business_account.id;
+                                const igUsernameFallback = primaryPage.instagram_business_account.username || null;
+                                const instagramUrl = igUsernameFallback ? `https://www.instagram.com/${igUsernameFallback}/` : null;
+                                
+                                try {
+                                        const igProfile = await fetchInstagramProfile(igId, pageToken);
+                                        const igUsername = igProfile.username || igUsernameFallback;
+                                        const igUrl = igUsername ? `https://www.instagram.com/${igUsername}/` : instagramUrl;
+                                        
+                                        await upsertSocialProfile({
+                                                hotelId,
+                                                provider: 'instagram',
+                                                profileName: igProfile.name || igUsername || null,
+                                                profileUrl: igUrl,
+                                                providerAccountId: igId,
+                                                facebookPageId: primaryPage.id,
+                                                instagramBusinessAccountId: igId,
+                                                status: 'active',
+                                                rawData: { username: igUsername }
+                                        });
+                                        
+                                        const rawMedia = await fetchInstagramMedia(igId, pageToken);
+                                        const media = rawMedia.map(normalizeInstagramMedia);
+                                        
+                                        await syncProviderActivity({
+                                                hotelId,
+                                                provider: 'instagram',
+                                                profileId: igId,
+                                                profileName: igProfile.name || igUsername || null,
+                                                profileUrl: igUrl,
+                                                followersCount: igProfile.followers_count || null,
+                                                pageLikesCount: null,
+                                                posts: media
+                                        });
+                                } catch (igErr) {
+                                        console.error('Meta sync error (instagram)', igErr.message);
+                                        await insertSocialActivitySnapshot({
+                                                hotelId,
+                                                provider: 'instagram',
+                                                profileId: igId,
+                                                profileName: null,
+                                                profileUrl: instagramUrl,
+                                                status: 'permission_needed',
+                                                recommendedAction: recommendedAction('instagram', 'permission_needed')
+                                        });
+                                }
+                        }
+                }
+                
+                const profiles = await getSocialProfilesByHotelId(hotelId);
+                const facebookProfile = profiles.find((p) => p.provider === 'facebook') || null;
+                const instagramProfile = profiles.find((p) => p.provider === 'instagram') || null;
+                
+                const igSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'instagram', 2);
+                const fbSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'facebook', 2);
+                
+                const instagram = buildProviderDetail('instagram', instagramProfile, igSnapshots);
+                const facebook = buildProviderDetail('facebook', facebookProfile, fbSnapshots);
+                const alerts = [alertForProvider('instagram', instagram.status), alertForProvider('facebook', facebook.status)].filter(Boolean);
+                const trend = buildTrend(igSnapshots, fbSnapshots);
+                
+                res.json({
+                        status: 'connected',
+                        instagram,
+                        facebook,
+                        alerts,
+                        trend: trend || undefined,
+                        message: 'Meta connected',
+                        pages_visible: pages.length
+                });
         } catch (err) {
-                    console.error('Meta social sync error', err.message);
-                    res.status(500).json({ error: 'Failed to sync social profiles', message: err.message });
+                console.error('Meta social sync error', err.message);
+                res.status(500).json({ error: 'Failed to sync social profiles', message: err.message });
         }
 });
 
