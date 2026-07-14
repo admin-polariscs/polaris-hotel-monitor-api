@@ -191,3 +191,130 @@ export async function getSocialProfilesByHotelId(hotelId) {
         );
     return result.rows;
 }
+
+
+// --- Social Activity Monitor (v3.14) persistence -------------------------------
+// social_posts is upserted idempotently on (hotel_id, provider, provider_post_id)
+// so repeated syncs update existing posts rather than duplicating them.
+// social_activity_snapshots gets one new row per sync/scan (append-only history).
+
+export async function upsertSocialPost({
+  hotelId,
+  provider,
+  providerPostId,
+  postUrl,
+  postDate,
+  messagePreview,
+  mediaType,
+  likeCount,
+  commentCount,
+  shareCount,
+  rawData
+}) {
+  const result = await pool.query(
+    `INSERT INTO social_posts (
+    hotel_id, provider, provider_post_id, post_url, post_date, message_preview,
+    media_type, like_count, comment_count, share_count, raw_data
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ON CONFLICT (hotel_id, provider, provider_post_id) DO UPDATE SET
+    post_url = EXCLUDED.post_url,
+    post_date = EXCLUDED.post_date,
+    message_preview = EXCLUDED.message_preview,
+    media_type = EXCLUDED.media_type,
+    like_count = EXCLUDED.like_count,
+    comment_count = EXCLUDED.comment_count,
+    share_count = EXCLUDED.share_count,
+    raw_data = EXCLUDED.raw_data,
+    updated_at = now()
+    RETURNING *`,
+    [
+      hotelId,
+      provider,
+      providerPostId,
+      postUrl || null,
+      postDate || null,
+      messagePreview || null,
+      mediaType || null,
+      likeCount === undefined ? null : likeCount,
+      commentCount === undefined ? null : commentCount,
+      shareCount === undefined ? null : shareCount,
+      rawData === undefined ? null : JSON.stringify(rawData)
+      ]
+    );
+  return result.rows[0];
+}
+
+export async function insertSocialActivitySnapshot({
+  hotelId,
+  provider,
+  scanId,
+  profileId,
+  profileName,
+  profileUrl,
+  followersCount,
+  pageLikesCount,
+  postsLast7Days,
+  postsLast14Days,
+  postsLast30Days,
+  likesLast30Days,
+  commentsLast30Days,
+  avgLikesPerPost30Days,
+  avgCommentsPerPost30Days,
+  lastPostDate,
+  daysSinceLastPost,
+  bestPostUrl,
+  bestPostLikes,
+  status,
+  recommendedAction,
+  rawData
+}) {
+  const result = await pool.query(
+    `INSERT INTO social_activity_snapshots (
+    hotel_id, provider, scan_id, profile_id, profile_name, profile_url, followers_count,
+    page_likes_count, posts_last_7_days, posts_last_14_days, posts_last_30_days,
+    likes_last_30_days, comments_last_30_days, avg_likes_per_post_30_days,
+    avg_comments_per_post_30_days, last_post_date, days_since_last_post, best_post_url,
+    best_post_likes, status, recommended_action, raw_data
+    )
+    VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+    )
+    RETURNING *`,
+    [
+      hotelId,
+      provider,
+      scanId || null,
+      profileId || null,
+      profileName || null,
+      profileUrl || null,
+      followersCount === undefined ? null : followersCount,
+      pageLikesCount === undefined ? null : pageLikesCount,
+      postsLast7Days === undefined ? null : postsLast7Days,
+      postsLast14Days === undefined ? null : postsLast14Days,
+      postsLast30Days === undefined ? null : postsLast30Days,
+      likesLast30Days === undefined ? null : likesLast30Days,
+      commentsLast30Days === undefined ? null : commentsLast30Days,
+      avgLikesPerPost30Days === undefined ? null : avgLikesPerPost30Days,
+      avgCommentsPerPost30Days === undefined ? null : avgCommentsPerPost30Days,
+      lastPostDate || null,
+      daysSinceLastPost === undefined ? null : daysSinceLastPost,
+      bestPostUrl || null,
+      bestPostLikes === undefined ? null : bestPostLikes,
+      status || 'access_needed',
+      recommendedAction || null,
+      rawData === undefined ? null : JSON.stringify(rawData)
+      ]
+    );
+  return result.rows[0];
+}
+
+// Most recent snapshots for a hotel/provider, newest first. Used to build the
+// customer-safe response and to compute trend deltas (row 0 = latest, row 1 = previous).
+export async function getRecentSocialActivitySnapshots(hotelId, provider, limit = 2) {
+  const result = await pool.query(
+    'SELECT * FROM social_activity_snapshots WHERE hotel_id = $1 AND provider = $2 ORDER BY snapshot_date DESC LIMIT $3',
+    [hotelId, provider, limit]
+    );
+  return result.rows;
+}
