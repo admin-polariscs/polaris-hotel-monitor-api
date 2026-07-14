@@ -5,6 +5,19 @@ import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiK
 import { getCompetitorsConnectorStatus, getGooglePlacesApiKey, resolveHotelLocation, searchNearbyHotels, classifyCompetitor } from './engines/googlePlaces.js';
 import { discoverContactPage } from './engines/contactPage.js';
 import {
+        getMetaConnectorStatus,
+        encodeState,
+        decodeState,
+        buildMetaLoginUrl,
+        encryptToken,
+        decryptToken,
+        exchangeCodeForToken,
+        exchangeForLongLivedToken,
+        fetchMetaUser,
+        fetchFacebookPages,
+        META_SCOPES
+} from './engines/metaSocial.js';
+import {
     pool,
     normaliseDomain,
     findOrCreateHotel,
@@ -13,7 +26,11 @@ import {
     failScan,
     storeScanResult,
     storeDiscoveredListing,
-    storeCompetitor
+    storeCompetitor,
+        upsertMetaConnection,
+        getMetaConnectionByHotelId,
+        upsertSocialProfile,
+        getSocialProfilesByHotelId
 } from './db.js';
 
 const app = express();
@@ -819,6 +836,209 @@ app.post('/hotels/:id/competitors/reset-location', async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: 'Failed to reset hotel location', message: err.message });
     }
+});
+
+// GET /meta/status - customer/ops-safe connector status. Never returns the app
+// secret or any token, only whether the connector is configured.
+app.get('/meta/status', (req, res) => {
+        res.json(getMetaConnectorStatus());
+});
+
+// GET /connect/meta?hotelId=:id - starts the Meta Login flow for a given hotel.
+// hotelId is embedded in a signed state string so /oauth/meta/callback can recover
+// it safely. Redirects the browser to Meta's own login/consent screen.
+app.get('/connect/meta', (req, res) => {
+        const status = getMetaConnectorStatus();
+        if (!status.configured) {
+                    return res.status(503).json({ error: 'Meta connector not configured', status: 'missing_env' });
+        }
+        const hotelId = req.query.hotelId || null;
+        const state = encodeState(hotelId);
+        res.redirect(buildMetaLoginUrl(state));
+});
+
+// GET /oauth/meta/callback - Meta redirects here after login/consent. Exchanges
+// the authorization code for an access token server-side (never in the browser),
+// extends it to a long-lived token where possible, and stores the connection.
+// Responds with a small, non-technical confirmation page - never with the token.
+app.get('/oauth/meta/callback', async (req, res) => {
+        const status = getMetaConnectorStatus();
+        if (!status.configured) {
+                    return res.status(503).send('Meta connection is not available right now. Please try again later.');
+        }
+    
+        const { code, state, error: metaError } = req.query;
+    
+        if (metaError) {
+                    return res.status(200).send('Meta connection was not completed. You can close this window and try again from your dashboard.');
+        }
+        if (!code) {
+                    return res.status(400).send('Meta connection is missing required information. Please try again from your dashboard.');
+        }
+    
+        const { hotelId, invalid } = decodeState(state);
+        if (invalid || !hotelId) {
+                    return res.status(400).send('Meta connection could not be verified. Please restart the connection from your dashboard.');
+        }
+        if (!pool) return res.status(503).send('This service is not fully configured yet. Please try again later.');
+    
+        try {
+                    const tokenResult = await exchangeCodeForToken(code);
+                    let accessToken = tokenResult.access_token;
+                    let expiresInSeconds = tokenResult.expires_in || null;
+            
+                    try {
+                                    const longLived = await exchangeForLongLivedToken(accessToken);
+                                    if (longLived && longLived.access_token) {
+                                                        accessToken = longLived.access_token;
+                                                        expiresInSeconds = longLived.expires_in || expiresInSeconds;
+                                    }
+                    } catch (longLivedErr) {
+                                    // Non-fatal: keep the short-lived token if the long-lived exchange fails.
+                                    console.error('Meta long-lived token exchange failed', longLivedErr.message);
+                    }
+            
+                    const metaUser = await fetchMetaUser(accessToken).catch(() => null);
+                    const tokenExpiresAt = expiresInSeconds ? new Date(Date.now() + expiresInSeconds * 1000) : null;
+            
+                    await upsertMetaConnection({
+                                    hotelId,
+                                    metaUserId: metaUser ? metaUser.id : null,
+                                    accessToken: encryptToken(accessToken),
+                                    tokenExpiresAt,
+                                    scopes: META_SCOPES,
+                                    status: 'connected',
+                                    rawData: { meta_user_name: metaUser ? metaUser.name : null }
+                    });
+            
+                    res.status(200).send('Your Meta account is connected. You can close this window and return to your dashboard.');
+        } catch (err) {
+                    console.error('Meta OAuth callback error', err.message);
+                    res.status(500).send('We could not complete the Meta connection. Please try again from your dashboard.');
+        }
+});
+
+// GET /hotels/:id/social - customer-safe connection/monitoring status for a hotel.
+// Never returns tokens, scopes, or raw Graph API data.
+app.get('/hotels/:id/social', async (req, res) => {
+        if (!pool) return res.status(503).json({ error: 'Database not configured' });
+        const hotelId = req.params.id;
+    
+        try {
+                    const connection = await getMetaConnectionByHotelId(hotelId);
+                    const profiles = await getSocialProfilesByHotelId(hotelId);
+            
+                    if (!connection || connection.status !== 'connected') {
+                                    return res.json({
+                                                        status: 'access_needed',
+                                                        instagram: { profile_found: false, profile_url: null, monitoring_active: false },
+                                                        facebook: { profile_found: false, profile_url: null, monitoring_active: false },
+                                                        message: 'Meta access needed'
+                                    });
+                    }
+            
+                    const facebookProfile = profiles.find((p) => p.provider === 'facebook') || null;
+                    const instagramProfile = profiles.find((p) => p.provider === 'instagram') || null;
+            
+                    res.json({
+                                    status: connection.status === 'connected' ? 'connected' : (connection.status || 'error'),
+                                    instagram: {
+                                                        profile_found: !!instagramProfile,
+                                                        profile_url: instagramProfile ? instagramProfile.profile_url : null,
+                                                        monitoring_active: false
+                                    },
+                                    facebook: {
+                                                        profile_found: !!facebookProfile,
+                                                        profile_url: facebookProfile ? facebookProfile.profile_url : null,
+                                                        monitoring_active: false
+                                    },
+                                    message: 'Meta connected'
+                    });
+        } catch (err) {
+                    res.status(500).json({ error: 'Failed to fetch social status', message: err.message });
+        }
+});
+
+// POST /hotels/:id/social/sync - for now: lists the Facebook Pages (and any linked
+// Instagram Business accounts) visible to the connected Meta user, and stores them
+// as social_profiles. Never fails the whole dashboard on a permissions problem -
+// degrades gracefully and reports back what could and couldn't be read.
+app.post('/hotels/:id/social/sync', async (req, res) => {
+        if (!pool) return res.status(503).json({ error: 'Database not configured' });
+        const hotelId = req.params.id;
+    
+        try {
+                    const connection = await getMetaConnectionByHotelId(hotelId);
+                    if (!connection || connection.status !== 'connected' || !connection.access_token) {
+                                    return res.json({ status: 'access_needed', message: 'Meta access needed' });
+                    }
+            
+                    const accessToken = decryptToken(connection.access_token);
+                    if (!accessToken) {
+                                    return res.json({ status: 'access_needed', message: 'Meta access needed' });
+                    }
+            
+                    let pages = [];
+                    try {
+                                    pages = await fetchFacebookPages(accessToken);
+                    } catch (graphErr) {
+                                    console.error('Meta sync error (fetchFacebookPages)', graphErr.message);
+                                    return res.json({
+                                                        status: 'error',
+                                                        message: 'Social partner follow-up needed',
+                                                        instagram: { profile_found: false, profile_url: null, monitoring_active: false },
+                                                        facebook: { profile_found: false, profile_url: null, monitoring_active: false }
+                                    });
+                    }
+            
+                    let facebookFound = false;
+                    let instagramFound = false;
+                    let facebookUrl = null;
+                    let instagramUrl = null;
+            
+                    for (const page of pages) {
+                                    facebookFound = true;
+                                    facebookUrl = page.link || null;
+                                    await upsertSocialProfile({
+                                                        hotelId,
+                                                        provider: 'facebook',
+                                                        profileName: page.name || null,
+                                                        profileUrl: page.link || null,
+                                                        providerAccountId: page.id,
+                                                        facebookPageId: page.id,
+                                                        status: 'active',
+                                                        rawData: { page_id: page.id, page_name: page.name || null }
+                                    });
+                        
+                                    if (page.instagram_business_account && page.instagram_business_account.id) {
+                                                        instagramFound = true;
+                                                        const igUsername = page.instagram_business_account.username || null;
+                                                        instagramUrl = igUsername ? `https://www.instagram.com/${igUsername}/` : null;
+                                                        await upsertSocialProfile({
+                                                                                hotelId,
+                                                                                provider: 'instagram',
+                                                                                profileName: page.instagram_business_account.name || igUsername || null,
+                                                                                profileUrl: instagramUrl,
+                                                                                providerAccountId: page.instagram_business_account.id,
+                                                                                facebookPageId: page.id,
+                                                                                instagramBusinessAccountId: page.instagram_business_account.id,
+                                                                                status: 'active',
+                                                                                rawData: { username: igUsername }
+                                                        });
+                                    }
+                    }
+            
+                    res.json({
+                                    status: 'connected',
+                                    instagram: { profile_found: instagramFound, profile_url: instagramUrl, monitoring_active: false },
+                                    facebook: { profile_found: facebookFound, profile_url: facebookUrl, monitoring_active: false },
+                                    message: 'Meta connected',
+                                    pages_visible: pages.length
+                    });
+        } catch (err) {
+                    console.error('Meta social sync error', err.message);
+                    res.status(500).json({ error: 'Failed to sync social profiles', message: err.message });
+        }
 });
 
 app.listen(port, () => {
