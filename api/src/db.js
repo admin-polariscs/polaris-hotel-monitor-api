@@ -103,3 +103,91 @@ export async function storeCompetitor({ hotelId, name, website, city, platformSo
                 ]
         );
 }
+
+// --- Meta (Facebook Login) connector persistence ------------------------------
+// One meta_connections row per hotel (unique on hotel_id). access_token is stored
+// already-encrypted by the caller (see engines/metaSocial.js) - this file never
+// encrypts/decrypts, it only persists whatever string it is given.
+
+export async function upsertMetaConnection({ hotelId, metaUserId, accessToken, tokenExpiresAt, scopes, status, rawData }) {
+    const result = await pool.query(
+          `INSERT INTO meta_connections (hotel_id, meta_user_id, access_token, token_expires_at, scopes, status, raw_data)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (hotel_id) DO UPDATE SET
+                           meta_user_id = EXCLUDED.meta_user_id,
+                                  access_token = EXCLUDED.access_token,
+                                         token_expires_at = EXCLUDED.token_expires_at,
+                                                scopes = EXCLUDED.scopes,
+                                                       status = EXCLUDED.status,
+                                                              raw_data = EXCLUDED.raw_data,
+                                                                     updated_at = now()
+                                                                          RETURNING *`,
+          [
+                  hotelId,
+                  metaUserId || null,
+                  accessToken || null,
+                  tokenExpiresAt || null,
+                  scopes === undefined ? null : JSON.stringify(scopes),
+                  status || 'connected',
+                  rawData === undefined ? null : JSON.stringify(rawData)
+                ]
+        );
+    return result.rows[0];
+}
+
+export async function getMetaConnectionByHotelId(hotelId) {
+    const result = await pool.query('SELECT * FROM meta_connections WHERE hotel_id = $1', [hotelId]);
+    return result.rows[0] || null;
+}
+
+// One social_profiles row per (hotel_id, provider, provider_account_id). Repeated
+// syncs update the existing row rather than duplicating it.
+export async function upsertSocialProfile({
+    hotelId,
+    provider,
+    profileName,
+    profileUrl,
+    providerAccountId,
+    facebookPageId,
+    instagramBusinessAccountId,
+    status,
+    rawData
+}) {
+    const result = await pool.query(
+          `INSERT INTO social_profiles (
+                 hotel_id, provider, profile_name, profile_url, provider_account_id,
+                        facebook_page_id, instagram_business_account_id, status, last_synced_at, raw_data
+                             )
+                                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)
+                                       ON CONFLICT (hotel_id, provider, provider_account_id) DO UPDATE SET
+                                              profile_name = EXCLUDED.profile_name,
+                                                     profile_url = EXCLUDED.profile_url,
+                                                            facebook_page_id = EXCLUDED.facebook_page_id,
+                                                                   instagram_business_account_id = EXCLUDED.instagram_business_account_id,
+                                                                          status = EXCLUDED.status,
+                                                                                 last_synced_at = now(),
+                                                                                        raw_data = EXCLUDED.raw_data,
+                                                                                               updated_at = now()
+                                                                                                    RETURNING *`,
+          [
+                  hotelId,
+                  provider,
+                  profileName || null,
+                  profileUrl || null,
+                  providerAccountId || null,
+                  facebookPageId || null,
+                  instagramBusinessAccountId || null,
+                  status || 'active',
+                  rawData === undefined ? null : JSON.stringify(rawData)
+                ]
+        );
+    return result.rows[0];
+}
+
+export async function getSocialProfilesByHotelId(hotelId) {
+    const result = await pool.query(
+          'SELECT * FROM social_profiles WHERE hotel_id = $1 ORDER BY provider ASC',
+          [hotelId]
+        );
+    return result.rows;
+}
