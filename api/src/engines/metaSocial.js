@@ -191,3 +191,51 @@ export async function fetchFacebookPages(accessToken) {
     const data = await graphFetch(`${GRAPH_BASE}/me/accounts?${params.toString()}`);
     return Array.isArray(data.data) ? data.data : [];
 }
+
+
+// --- Social Activity Monitor (v3.14) additions ---------------------------------
+// Still official Graph API only, no scraping. These calls add the fields needed
+// to compute real Instagram/Facebook activity metrics (v3.14): page access
+// tokens, follower/fan counts, and recent posts/media with engagement counts.
+
+// Facebook Pages with page access token + fan/follower counts + linked IG account.
+export async function fetchFacebookPagesWithTokens(accessToken) {
+    const params = new URLSearchParams({
+        fields: 'id,name,link,fan_count,followers_count,access_token,instagram_business_account{id,username,name,profile_picture_url}',
+        access_token: accessToken
+    });
+    const data = await graphFetch(`${GRAPH_BASE}/me/accounts?${params.toString()}`);
+    return Array.isArray(data.data) ? data.data : [];
+}
+
+// Recent Facebook Page posts (message, timestamps, reactions/comments/shares).
+// Uses the Page access token where available.
+export async function fetchFacebookPagePosts(pageId, pageAccessToken, limit = 25) {
+    const params = new URLSearchParams({
+        fields: 'id,message,created_time,permalink_url,reactions.summary(true),comments.summary(true),shares',
+        limit: String(limit),
+        access_token: pageAccessToken
+    });
+    const data = await graphFetch(`${GRAPH_BASE}/${pageId}/posts?${params.toString()}`);
+    return Array.isArray(data.data) ? data.data : [];
+}
+
+// Instagram Business/Creator account profile fields (followers/media counts).
+export async function fetchInstagramProfile(igUserId, pageAccessToken) {
+    const params = new URLSearchParams({
+        fields: 'id,username,name,profile_picture_url,followers_count,media_count',
+        access_token: pageAccessToken
+    });
+    return graphFetch(`${GRAPH_BASE}/${igUserId}?${params.toString()}`);
+}
+
+// Recent Instagram media (caption, timestamp, permalink, media type, like/comment counts).
+export async function fetchInstagramMedia(igUserId, pageAccessToken, limit = 25) {
+    const params = new URLSearchParams({
+        fields: 'id,caption,media_type,timestamp,permalink,like_count,comments_count',
+        limit: String(limit),
+        access_token: pageAccessToken
+    });
+    const data = await graphFetch(`${GRAPH_BASE}/${igUserId}/media?${params.toString()}`);
+    return Array.isArray(data.data) ? data.data : [];
+}
