@@ -3,6 +3,7 @@ import cors from 'cors';
 import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
 import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, getTripadvisorApiMode, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
 import { getCompetitorsConnectorStatus, getGooglePlacesApiKey, resolveHotelLocation, searchNearbyHotels, classifyCompetitor } from './engines/googlePlaces.js';
+import { discoverContactPage } from './engines/contactPage.js';
 import {
     pool,
     normaliseDomain,
@@ -528,60 +529,123 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
                  let lng = hotel.longitude !== null ? Number(hotel.longitude) : null;
                  let locationSource = 'stored';
                  let locationConfidence = hotel.location_confidence || null;
+                 let contactPageUrl = hotel.contact_page_url || null;
                  
                  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-                     const resolved = await resolveHotelLocation(hotel);
-                     const top = resolved && resolved.top ? resolved.top : null;
+                     const contact = await discoverContactPage(hotel);
                      
-                     if (!top || top.confidence === 'low') {
+                     if (contact) {
+                         contactPageUrl = contact.contact_page_url;
                          await pool.query(
-                             "UPDATE hotels SET location_confidence = 'low', updated_at = now() WHERE id = $1",
-                             [hotelId]
+                             `UPDATE hotels SET
+                             contact_page_url = $1,
+                             extracted_address = $2,
+                             extracted_city = $3,
+                             extracted_country = $4,
+                             extracted_phone = $5,
+                             extracted_email = $6,
+                             extracted_social_links = $7,
+                             contact_confidence = $8,
+                             updated_at = now()
+                             WHERE id = $9`,
+                             [
+                                 contact.contact_page_url || null,
+                                 contact.extracted_address || null,
+                                 contact.extracted_city || null,
+                                 contact.extracted_country || null,
+                                 contact.extracted_phone || null,
+                                 contact.extracted_email || null,
+                                 contact.extracted_social_links ? JSON.stringify(contact.extracted_social_links) : null,
+                                 contact.contact_confidence || null,
+                                 hotelId
+                                 ]
                              );
-                         return res.json({
-                             status: 'location_needs_verification',
-                             message: 'Hotel location needs verification before competitive set discovery.',
-                             location_confidence: 'low',
-                             candidate_matches: (resolved ? resolved.candidates : []).map((c) => ({
-                                 place_id: c.place_id,
-                                 name: c.name,
-                                 formatted_address: c.formatted_address,
-                                 website: c.website,
-                                 lat: c.lat,
-                                 lng: c.lng,
-                                 confidence: c.confidence,
-                                 reasons: c.reasons
-                             }))
-                         });
                      }
                      
-                     lat = top.lat;
-                     lng = top.lng;
-                     locationSource = 'resolved_via_google_places';
-                     locationConfidence = top.confidence;
+                     const contactGaveDirectLatLng = !!(contact && Number.isFinite(contact.extracted_lat) && Number.isFinite(contact.extracted_lng));
+                     const contactGaveAddressContext = !!(contact && (contact.extracted_address || contact.extracted_city || contact.extracted_country));
                      
-                     await pool.query(
-                         `UPDATE hotels SET
-                         latitude = $1,
-                         longitude = $2,
-                         google_place_id = $3,
-                         address = COALESCE(address, $4),
-                         city = COALESCE(city, $5),
-                         country = COALESCE(country, $6),
-                         location_confidence = $7,
-                         updated_at = now()
-                         WHERE id = $8`,
-                         [
-                             lat,
-                             lng,
-                             top.place_id || null,
-                             top.formatted_address || null,
-                             top.city_component || null,
-                             top.country_component || null,
-                             locationConfidence,
-                             hotelId
-                             ]
-                         );
+                     if (contactGaveDirectLatLng) {
+                         lat = contact.extracted_lat;
+                         lng = contact.extracted_lng;
+                         locationSource = 'structured_data';
+                         locationConfidence = 'high';
+                         
+                         await pool.query(
+                             `UPDATE hotels SET
+                             latitude = $1,
+                             longitude = $2,
+                             address = COALESCE(address, $3),
+                             city = COALESCE(city, $4),
+                             country = COALESCE(country, $5),
+                             location_confidence = $6,
+                             updated_at = now()
+                             WHERE id = $7`,
+                             [lat, lng, contact.extracted_address || null, contact.extracted_city || null, contact.extracted_country || null, locationConfidence, hotelId]
+                             );
+                     } else {
+                         const hotelForQuery = contactGaveAddressContext ? {
+                             ...hotel,
+                             address: hotel.address || contact.extracted_address || null,
+                             city: hotel.city || contact.extracted_city || null,
+                             country: hotel.country || contact.extracted_country || null
+                         } : hotel;
+                         
+                         const resolved = await resolveHotelLocation(hotelForQuery);
+                         const top = resolved && resolved.top ? resolved.top : null;
+                         
+                         if (!top || top.confidence === 'low') {
+                             await pool.query(
+                                 "UPDATE hotels SET location_confidence = 'low', updated_at = now() WHERE id = $1",
+                                 [hotelId]
+                                 );
+                             return res.json({
+                                 status: 'location_needs_verification',
+                                 message: 'Hotel location needs verification before competitive set discovery.',
+                                 location_confidence: 'low',
+                                 location_source: 'needs_verification',
+                                 contact_page_url: contactPageUrl,
+                                 candidate_matches: (resolved ? resolved.candidates : []).map((c) => ({
+                                     place_id: c.place_id,
+                                     name: c.name,
+                                     formatted_address: c.formatted_address,
+                                     website: c.website,
+                                     lat: c.lat,
+                                     lng: c.lng,
+                                     confidence: c.confidence,
+                                     reasons: c.reasons
+                                 }))
+                             });
+                         }
+                         
+                         lat = top.lat;
+                         lng = top.lng;
+                         locationConfidence = top.confidence;
+                         locationSource = contactGaveAddressContext ? contact.source : 'google_places_verified';
+                         
+                         await pool.query(
+                             `UPDATE hotels SET
+                             latitude = $1,
+                             longitude = $2,
+                             google_place_id = $3,
+                             address = COALESCE(address, $4),
+                             city = COALESCE(city, $5),
+                             country = COALESCE(country, $6),
+                             location_confidence = $7,
+                             updated_at = now()
+                             WHERE id = $8`,
+                             [
+                                 lat,
+                                 lng,
+                                 top.place_id || null,
+                                 top.formatted_address || null,
+                                 top.city_component || null,
+                                 top.country_component || null,
+                                 locationConfidence,
+                                 hotelId
+                                 ]
+                             );
+                     }
                  } else if (locationSource === 'stored' && !locationConfidence) {
                      // Pre-existing stored coordinates from before location verification was introduced.
                      // Trusted as-is so we don't break hotels that were already working correctly.
@@ -640,6 +704,7 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
         hotel_id: Number(hotelId),
         location_source: locationSource,
         location_confidence: locationConfidence,
+        contact_page_url: contactPageUrl,
         primary_competitors: primaryVisible,
         secondary_competitors: secondaryVisible,
         nearby_not_comparable: nearbyNotComparable,
