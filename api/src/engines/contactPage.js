@@ -53,7 +53,7 @@ async function fetchWithTimeout(url, timeoutMs) {
 // parsing - this is intentionally not a full HTML parser, just enough to find links.
 function extractLinks(html) {
   const links = [];
-  const re = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi;
+  const re = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let match;
   while ((match = re.exec(html)) !== null) {
     const href = match[1];
@@ -144,7 +144,7 @@ function extractJsonLd(html) {
       if (!item || typeof item !== 'object') continue;
       const type = item['@type'];
       const types = Array.isArray(type) ? type : [type];
-      const isRelevant = types.some((t) => typeof t === 'string' && /hotel|lodgingbusiness|localbusiness|organization/i.test(t));
+      const isRelevant = types.some((t) => typeof t === 'string' && /hotel|lodgingbusiness|localbusiness/i.test(t));
       if (isRelevant) results.push(item);
     }
   }
@@ -162,9 +162,9 @@ function firstString(value) {
 function extractSocialLinksFromHtml(html) {
   const social = { instagram: null, facebook: null, linkedin: null };
   const patterns = {
-    instagram: /https?:\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9_.]+/i,
-    facebook: /https?:\/\/(?:www\.)?facebook\.com\/[a-zA-Z0-9_.\-]+/i,
-    linkedin: /https?:\/\/(?:www\.)?linkedin\.com\/company\/[a-zA-Z0-9_\-]+/i
+    instagram: /https?:\/\/(www\.)?instagram\.com\/[^\s"'<>]+/i,
+    facebook: /https?:\/\/(www\.)?facebook\.com\/[^\s"'<>]+/i,
+    linkedin: /https?:\/\/(www\.)?linkedin\.com\/[^\s"'<>]+/i
   };
   for (const key of Object.keys(patterns)) {
     const match = html.match(patterns[key]);
@@ -174,7 +174,7 @@ function extractSocialLinksFromHtml(html) {
 }
 
 function extractGoogleMapsLink(html) {
-  const match = html.match(/https?:\/\/(?:www\.)?google\.[a-z.]+\/maps[^\s"'<>]*/i);
+  const match = html.match(/https?:\/\/(www\.)?(google\.[a-z.]+\/maps|maps\.app\.goo\.gl|goo\.gl\/maps)[^\s"'<>]*/i);
   return match ? match[0] : null;
 }
 // --- Plain-text (non JSON-LD) address + coordinate detection -------------------
@@ -318,7 +318,7 @@ function extractLatLng(html, jsonLdItems) {
       if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
     }
   }
-  const match = html.match(/"latitude"\s*:\s*(-?\d+\.\d+)[^}]*"longitude"\s*:\s*(-?\d+\.\d+)/i);
+  const match = html.match(/"latitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?[^}]*"longitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?/i);
   if (match) {
     const lat = Number(match[1]);
     const lng = Number(match[2]);
@@ -328,14 +328,14 @@ function extractLatLng(html, jsonLdItems) {
 }
 
 function extractEmail(html) {
-  const match = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  const match = html.match(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+/);
   return match ? match[0] : null;
 }
 
 function extractPhone(html) {
   const telMatch = html.match(/href=["']tel:([^"']+)["']/i);
   if (telMatch) return telMatch[1].trim();
-  const match = html.match(/\+\d[\d\s().-]{6,}\d/);
+  const match = html.match(/\+\d{1,3}[\s.\/-]?\(?\d{1,4}\)?[\s.\/-]?\d{2,4}[\s.\/-]?\d{2,4}[\s.\/-]?\d{0,4}/);
   return match ? match[0].trim() : null;
 }
 // Parses a single contact-page candidate's HTML into structured NAP data.
@@ -405,7 +405,7 @@ return {
   phone: extractPhone(html),
   email: extractEmail(html),
   social_links: socialFromHtml,
-  has_structured_data: jsonLdItems.length > 0 || addressSource === 'structured_data'
+  has_structured_data: jsonLdItems.length > 0 && addressSource === 'structured_data'
 };
 }
 // Scores how useful a parsed contact page result is, and builds the flattened
