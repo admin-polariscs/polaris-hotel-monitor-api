@@ -612,7 +612,7 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
                          const hotelForQuery = contactGaveAddressContext ? {
                              ...hotel,
                              address: hotel.address || contact.extracted_address || null,
-                             city: hotel.city || contact.extracted_city || null,
+                             city: hotel.city || (contact.extracted_postal_code ? `${contact.extracted_postal_code} ${contact.extracted_city || ''}`.trim() : contact.extracted_city) || null,
                              country: hotel.country || contact.extracted_country || null
                          } : hotel;
                          
@@ -646,7 +646,7 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
                          lat = top.lat;
                          lng = top.lng;
                          locationConfidence = top.confidence;
-                         locationSource = contactGaveAddressContext ? contact.source : 'google_places_verified';
+                         locationSource = contactGaveAddressContext ? 'contact_page_plus_google_places' : 'google_places_verified';
                          
                          await pool.query(
                              `UPDATE hotels SET
