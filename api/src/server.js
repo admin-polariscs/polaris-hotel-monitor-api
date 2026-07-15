@@ -755,7 +755,7 @@ app.get('/hotels/:id/competitors', async (req, res) => {
     if (!pool) return res.status(503).json({ error: 'Database not configured' });
     try {
         const result = await pool.query(
-            "SELECT id, name, website, city, platform_source, confidence, distance_km, raw_data, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' ORDER BY confidence DESC NULLS LAST, distance_km ASC NULLS LAST",
+                        "SELECT id, name, website, city, platform_source, confidence, distance_km, raw_data, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' AND (raw_data->>'invalidated' IS DISTINCT FROM 'true') ORDER BY confidence DESC NULLS LAST, distance_km ASC NULLS LAST",
             [req.params.id]
             );
         const rows = result.rows;
@@ -781,7 +781,7 @@ app.get('/hotels/:id/competitors', async (req, res) => {
 app.patch('/hotels/:id/profile', async (req, res) => {
     if (!pool) return res.status(503).json({ error: 'Database not configured' });
     const hotelId = req.params.id;
-    const { name, address, city, country, phone } = req.body || {};
+        const { name, address, city, country, phone, latitude, longitude, google_place_id, location_confidence, location_source } = req.body || {};
     
     const fields = [];
     const values = [];
@@ -791,6 +791,11 @@ app.patch('/hotels/:id/profile', async (req, res) => {
     if (city !== undefined) { fields.push(`city = $${i++}`); values.push(city); }
     if (country !== undefined) { fields.push(`country = $${i++}`); values.push(country); }
     if (phone !== undefined) { fields.push(`phone = $${i++}`); values.push(phone); }
+        if (latitude !== undefined) { fields.push(`latitude = $${i++}`); values.push(latitude); }
+                if (longitude !== undefined) { fields.push(`longitude = $${i++}`); values.push(longitude); }
+                if (google_place_id !== undefined) { fields.push(`google_place_id = $${i++}`); values.push(google_place_id); }
+                if (location_confidence !== undefined) { fields.push(`location_confidence = $${i++}`); values.push(location_confidence); }
+                if (location_source !== undefined) { fields.push(`location_source = $${i++}`); values.push(location_source); }
     
     if (!fields.length) {
         return res.status(400).json({ error: 'No profile fields provided. Accepted fields: name, address, city, country, phone.' });
@@ -808,6 +813,43 @@ app.patch('/hotels/:id/profile', async (req, res) => {
         res.status(500).json({ error: 'Failed to update hotel profile', message: err.message });
     }
 });
+// PATCH /hotels/:id/competitors/invalidate - soft-invalidates specific competitor rows
+// for a hotel. Never deletes: marks rows via raw_data.invalidated so GET /hotels/:id/
+// competitors (which filters on raw_data.invalidated) stops showing them, while the
+// rows themselves - and the reason/previous location context - remain in the database.
+app.patch('/hotels/:id/competitors/invalidate', async (req, res) => {
+            if (!pool) return res.status(503).json({ error: 'Database not configured' });
+            const hotelId = req.params.id;
+            const { competitorIds, reason, previousHotelLocation } = req.body || {};
+
+            if (!Array.isArray(competitorIds) || !competitorIds.length) {
+                            return res.status(400).json({ error: 'competitorIds (non-empty array) is required' });
+            }
+
+            const metadata = {
+                            invalidated: true,
+                            invalidated_reason: reason || null,
+                            invalidated_at: new Date().toISOString(),
+                            previous_hotel_location: previousHotelLocation || null
+            };
+
+            try {
+                            const result = await pool.query(
+                                                `UPDATE competitors SET raw_data = COALESCE(raw_data, '{}'::jsonb) || $1::jsonb
+                                                            WHERE hotel_id = $2 AND id = ANY($3::int[])
+                                                                        RETURNING id, name`,
+                                                [JSON.stringify(metadata), hotelId, competitorIds]
+                                                );
+                            res.json({
+                                                hotel_id: Number(hotelId),
+                                                invalidated_count: result.rows.length,
+                                                invalidated: result.rows
+                            });
+            } catch (err) {
+                            res.status(500).json({ error: 'Failed to invalidate competitors', message: err.message });
+            }
+});
+
 
 // POST /hotels/:id/competitors/reset-location - clears a hotel's resolved location
 // (latitude/longitude/google_place_id/location_confidence) and deletes its previously
