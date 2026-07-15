@@ -208,7 +208,7 @@ function extractListItemLines(html) {
 //   "75008 Paris, France"                  (French: 5 digits)
 //   "10115 Berlin, Germany"                (German: 5 digits)
 const POSTAL_CITY_COUNTRY_RE =
-  /^([A-Z0-9][A-Z0-9-]{1,9})\s+([A-Za-z\u00C0-\u017F](?:[A-Za-z\u00C0-\u017F .'-])*?)(?:\s*[-,]\s*(.+))?$/;
+  /^(\d{4}\s?[A-Z]{2}|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}|[A-Z0-9]{2,10})\s+([A-Za-z\u00C0-\u017F](?:[A-Za-z\u00C0-\u017F .'-])*?)(?:\s*[-,]\s*(.+))?$/;
 
 function parsePostalCityCountry(line) {
   if (!line) return null;
