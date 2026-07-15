@@ -496,4 +496,4 @@ try {
 }
 }
 
-module.exports = { discoverContactPage };
+export { discoverContactPage };
