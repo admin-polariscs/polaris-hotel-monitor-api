@@ -703,14 +703,22 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
                      secondaryVisible = secondaryVisible.slice(0, Math.max(0, MAX_VISIBLE_TOTAL - primaryVisible.length));
                  }
 
-    // Idempotent by design: replace this hotel's Google Places competitive set rather
-    // than appending, so repeated discover calls update instead of duplicating rows.
-    // Only useful candidates (primary/secondary) are persisted - nearby_not_comparable
-    // and excluded are returned in the response for transparency only, never stored.
-    await pool.query(
-        "DELETE FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places'",
-        [hotelId]
-        );
+		// Idempotent by design: before storing a fresh Google Places competitive set,
+                     		// any previously-active rows for this hotel are soft-invalidated (never
+                     		// deleted) so repeated discover calls supersede old rows instead of
+                     		// deleting or duplicating them. Only useful candidates (primary/secondary)
+                     		// are persisted - nearby_not_comparable and excluded are returned in the
+                     		// response for transparency only, never stored.
+                     		await pool.query(
+                                        			`UPDATE competitors SET raw_data = COALESCE(raw_data, '{}'::jsonb) || $2::jsonb
+                                                                			 WHERE hotel_id = $1 AND platform_source = 'google_places'
+                                                                                         			   AND (raw_data->>'invalidated' IS DISTINCT FROM 'true')`,
+                                        			[hotelId, JSON.stringify({
+                                                                        				invalidated: true,
+                                                                        				invalidated_reason: 'superseded_by_new_discovery_run',
+                                                                        				invalidated_at: new Date().toISOString()
+                                                                        })]
+                                        		);
 
     for (const item of [...primaryVisible, ...secondaryVisible]) {
         await storeCompetitor({
