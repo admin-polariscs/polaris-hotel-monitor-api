@@ -288,6 +288,23 @@ function extractPlainTextAddress(lines, hotelName) {
 // map-widget data attributes rather than JSON-LD, e.g. a Leaflet/OpenStreetMap
 // embed showing "52.371111 / 4.895433" or data-lat="52.371111" data-lng="4.895433".
 function extractLooseLatLng(html) {
+  // Prefer explicitly-labeled lat/lng elements (e.g. <div id="default-lat">52.371111</div>
+      // <div id="default-lng">4.895433</div>) over any other numbers on the page. Some hotel
+      // site templates also declare an unrelated fallback/default map-center coordinate (e.g.
+      // "const parisLat = 48.85...; const parisLng = 2.35...;") used only when the real
+      // marker data fails to load - that fallback must never be picked up as the hotel's
+      // own location, so labeled elements are checked first and take priority.
+      const labeledMatch = html.match(
+              /id=["']?[\w-]*\b(?:latitude|lat)\b[\w-]*["']?[^>]*>\s*(-?\d{1,3}\.\d{3,8})\s*<[\s\S]{0,300}?id=["']?[\w-]*\b(?:longitude|lng|lon)\b[\w-]*["']?[^>]*>\s*(-?\d{1,3}\.\d{3,8})\s*</i
+              );
+      if (labeledMatch) {
+              const lat = Number(labeledMatch[1]);
+              const lng = Number(labeledMatch[2]);
+              if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+                        return { lat, lng };
+              }
+      }
+    
   const attrMatch = html.match(
     /data-(?:lat|latitude)=["']?(-?\d{1,3}\.\d+)["']?[^>]{0,80}?data-(?:lng|lon|longitude)=["']?(-?\d{1,3}\.\d+)["']?/i
     );
