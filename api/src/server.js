@@ -19,7 +19,10 @@ fetchFacebookPagesWithTokens,
         	fetchFacebookPagePosts,
         	fetchInstagramProfile,
         	fetchInstagramMedia,
-        	META_SCOPES
+        	META_SCOPES,
+		scoreFacebookPageCandidate,
+		mappingStatusForScore,
+		buildSocialPageCandidate
 } from './engines/metaSocial.js';
 import { computeActivityMetrics, instagramStatus, facebookStatus, recommendedAction, alertForProvider } from './engines/socialActivity.js';
 import {
@@ -39,6 +42,9 @@ import {
         	upsertSocialPost,
         	insertSocialActivitySnapshot,
         	getRecentSocialActivitySnapshots,
+		getSocialPageMapping,
+		upsertSocialPageMapping,
+		invalidateSocialActivityForPageIds,
 } from './db.js';
 
 const app = express();
@@ -1154,26 +1160,47 @@ app.get('/hotels/:id/social', async (req, res) => {
                         });
                 }
                 
-                const facebookProfile = profiles.find((p) => p.provider === 'facebook') || null;
-                const instagramProfile = profiles.find((p) => p.provider === 'instagram') || null;
-                
-                const igSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'instagram', 2);
-                const fbSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'facebook', 2);
-                
-                const instagram = buildProviderDetail('instagram', instagramProfile, igSnapshots);
-                const facebook = buildProviderDetail('facebook', facebookProfile, fbSnapshots);
-                
-                const alerts = [alertForProvider('instagram', instagram.status), alertForProvider('facebook', facebook.status)].filter(Boolean);
-                const trend = buildTrend(igSnapshots, fbSnapshots);
-                
-                res.json({
-                        status: 'connected',
-                        instagram,
-                        facebook,
-                        alerts,
-                        trend: trend || undefined,
-                        message: 'Meta connected'
-                });
+const mapping = await getSocialPageMapping(hotelId);
+						const mappingStatus = mapping ? mapping.mapping_status : 'not_mapped';
+
+						const gateHotelResult = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+						const gateHotelRow = gateHotelResult.rows[0] || null;
+						const websiteFacebookFound = !!(gateHotelRow && gateHotelRow.extracted_social_links && gateHotelRow.extracted_social_links.facebook);
+						const websiteInstagramFound = !!(gateHotelRow && gateHotelRow.extracted_social_links && gateHotelRow.extracted_social_links.instagram);
+
+						if (!mapping || mappingStatus === 'not_mapped' || mappingStatus === 'needs_confirmation') {
+											return res.json({
+																	status: 'mapping_needed',
+																	mapping_status: mappingStatus,
+																	mapping_confidence: mapping ? mapping.mapping_confidence : null,
+																	instagram: { profile_found: websiteInstagramFound, profile_url: null, monitoring_active: false },
+																	facebook: { profile_found: websiteFacebookFound, profile_url: null, monitoring_active: false },
+																	message: 'Social profiles need confirmation before monitoring can start.'
+											});
+						}
+
+						const facebookProfile = profiles.find((p) => p.provider === 'facebook' && String(p.facebook_page_id) === String(mapping.facebook_page_id)) || null;
+						const instagramProfile = profiles.find((p) => p.provider === 'instagram' && String(p.instagram_business_account_id) === String(mapping.instagram_business_account_id)) || null;
+
+						const igSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'instagram', 2, mapping.instagram_business_account_id || null);
+						const fbSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'facebook', 2, mapping.facebook_page_id || null);
+
+						const instagram = buildProviderDetail('instagram', instagramProfile, igSnapshots);
+						const facebook = buildProviderDetail('facebook', facebookProfile, fbSnapshots);
+
+						const alerts = [alertForProvider('instagram', instagram.status), alertForProvider('facebook', facebook.status)].filter(Boolean);
+						const trend = buildTrend(igSnapshots, fbSnapshots);
+
+						res.json({
+											status: 'connected',
+											mapping_status: mappingStatus,
+											mapping_confidence: mapping.mapping_confidence,
+											instagram,
+											facebook,
+											alerts,
+											trend: trend || undefined,
+											message: 'Meta connected'
+						});
         } catch (err) {
                 res.status(500).json({ error: 'Failed to fetch social status', message: err.message });
         }
@@ -1210,7 +1237,66 @@ app.post('/hotels/:id/social/sync', async (req, res) => {
                         });
                 }
                 
-                const primaryPage = pages.length ? pages[0] : null;
+                // Resolve which Facebook Page belongs to this hotel. Never trust "the first
+						// Page returned by Meta" - always use the hotel's confirmed mapping, or run
+						// the same auto-match scoring used by GET /hotels/:id/social/candidates.
+						const mappingHotelResult = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+						const mappingHotelRow = mappingHotelResult.rows[0] || null;
+
+						let mapping = await getSocialPageMapping(hotelId);
+
+						if (!mapping || mapping.mapping_status === 'not_mapped') {
+											let topCandidate = null;
+											if (pages.length && mappingHotelRow) {
+																	const scored = pages
+																		.map((p) => ({ page: p, ...scoreFacebookPageCandidate(p, mappingHotelRow) }))
+																		.sort((a, b) => b.score - a.score);
+																	topCandidate = scored[0];
+											}
+											if (topCandidate && mappingStatusForScore(topCandidate.score) === 'auto_matched') {
+																	const igAccount = topCandidate.page.instagram_business_account || null;
+																	const igUsername = igAccount ? (igAccount.username || null) : null;
+																	const source = (topCandidate.reasons.includes('exact_facebook_url_match') || topCandidate.reasons.includes('exact_instagram_username_match'))
+																		? 'website_social_link'
+																								: (topCandidate.reasons.includes('page_website_domain_match') ? 'page_website' : 'page_name');
+																	mapping = await upsertSocialPageMapping({
+																								hotelId,
+																								facebookPageId: topCandidate.page.id,
+																								facebookPageName: topCandidate.page.name || null,
+																								facebookPageUrl: topCandidate.page.link || null,
+																								instagramBusinessAccountId: igAccount ? igAccount.id : null,
+																								instagramUsername: igUsername,
+																								instagramProfileUrl: igUsername ? `https://www.instagram.com/${igUsername}/` : null,
+																								mappingStatus: 'auto_matched',
+																								mappingConfidence: topCandidate.score,
+																								mappingSource: source
+																	});
+											} else {
+																	return res.json({
+																								status: 'mapping_needed',
+																								monitoring_active: false,
+																								message: 'Social profiles need confirmation before monitoring can start.'
+																	});
+											}
+						} else if (mapping.mapping_status === 'needs_confirmation') {
+											return res.json({
+																	status: 'mapping_needed',
+																	monitoring_active: false,
+																	message: 'Social profiles need confirmation before monitoring can start.'
+											});
+						}
+
+						const primaryPage = (mapping && mapping.facebook_page_id)
+							? (pages.find((p) => String(p.id) === String(mapping.facebook_page_id)) || null)
+											: null;
+
+						if (mapping && mapping.facebook_page_id && !primaryPage) {
+											return res.json({
+																	status: 'mapping_needed',
+																	monitoring_active: false,
+																	message: 'The mapped Facebook Page is no longer visible to this Meta connection. Please re-confirm mapping.'
+											});
+						}
                 
                 if (primaryPage) {
                         await upsertSocialProfile({
@@ -1303,11 +1389,11 @@ app.post('/hotels/:id/social/sync', async (req, res) => {
                 }
                 
                 const profiles = await getSocialProfilesByHotelId(hotelId);
-                const facebookProfile = profiles.find((p) => p.provider === 'facebook') || null;
-                const instagramProfile = profiles.find((p) => p.provider === 'instagram') || null;
+const facebookProfile = profiles.find((p) => p.provider === 'facebook' && String(p.facebook_page_id) === String(primaryPage.id)) || null;
+						const instagramProfile = profiles.find((p) => p.provider === 'instagram' && primaryPage.instagram_business_account && String(p.instagram_business_account_id) === String(primaryPage.instagram_business_account.id)) || null;
                 
-                const igSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'instagram', 2);
-                const fbSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'facebook', 2);
+const igSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'instagram', 2, (primaryPage.instagram_business_account && primaryPage.instagram_business_account.id) || null);
+						const fbSnapshots = await getRecentSocialActivitySnapshots(hotelId, 'facebook', 2, primaryPage.id || null);
                 
                 const instagram = buildProviderDetail('instagram', instagramProfile, igSnapshots);
                 const facebook = buildProviderDetail('facebook', facebookProfile, fbSnapshots);
@@ -1316,6 +1402,8 @@ app.post('/hotels/:id/social/sync', async (req, res) => {
                 
                 res.json({
                         status: 'connected',
+								mapping_status: mapping.mapping_status,
+								mapping_confidence: mapping.mapping_confidence,
                         instagram,
                         facebook,
                         alerts,
@@ -1327,6 +1415,134 @@ app.post('/hotels/:id/social/sync', async (req, res) => {
                 console.error('Meta social sync error', err.message);
                 res.status(500).json({ error: 'Failed to sync social profiles', message: err.message });
         }
+});
+
+// GET /hotels/:id/social/candidates - lists every Facebook Page visible to the
+// connected Meta account for this hotel, scored against the hotel's known identity
+// signals, with its linked Instagram Business account if any. Customer/admin-safe
+// only: no access_token or other raw Graph API/debug data is ever returned.
+app.get('/hotels/:id/social/candidates', async (req, res) => {
+		if (!pool) return res.status(503).json({ error: 'Database not configured' });
+		const hotelId = req.params.id;
+	
+		try {
+					const connection = await getMetaConnectionByHotelId(hotelId);
+					if (!connection || connection.status !== 'connected' || !connection.access_token) {
+									return res.json({ status: 'access_needed', message: 'Meta access needed', candidates: [] });
+					}
+			
+					const accessToken = decryptToken(connection.access_token);
+					if (!accessToken) {
+									return res.json({ status: 'access_needed', message: 'Meta access needed', candidates: [] });
+					}
+			
+					const hotelResult = await pool.query('SELECT * FROM hotels WHERE id = $1', [hotelId]);
+					const hotelRow = hotelResult.rows[0] || null;
+					if (!hotelRow) return res.status(404).json({ error: 'Hotel not found' });
+			
+					let pages = [];
+					try {
+									pages = await fetchFacebookPagesWithTokens(accessToken);
+					} catch (graphErr) {
+									console.error('Meta candidates error (fetchFacebookPagesWithTokens)', graphErr.message);
+									return res.json({ status: 'error', message: 'Social partner follow-up needed', candidates: [] });
+					}
+			
+					const scored = pages
+									.map((p) => ({ page: p, score: scoreFacebookPageCandidate(p, hotelRow).score }))
+									.sort((a, b) => b.score - a.score);
+					const topPageId = scored.length ? scored[0].page.id : null;
+			
+					const candidates = pages
+									.map((p) => buildSocialPageCandidate(p, hotelRow, p.id === topPageId))
+									.sort((a, b) => b.match_score - a.match_score);
+			
+					res.json({ status: 'ok', hotel_id: Number(hotelId), candidates });
+		} catch (err) {
+					res.status(500).json({ error: 'Failed to list social candidates', message: err.message });
+		}
+});
+
+// POST /hotels/:id/social/mapping - manually confirms which Facebook Page (and,
+// optionally, which Instagram Business account) is correct for this hotel. The
+// Page must be visible to the hotel's connected Meta account - this never allows
+// mapping to an arbitrary Page ID the account cannot actually see.
+app.post('/hotels/:id/social/mapping', async (req, res) => {
+		if (!pool) return res.status(503).json({ error: 'Database not configured' });
+		const hotelId = req.params.id;
+		const { facebook_page_id: facebookPageId, instagram_business_account_id: instagramBusinessAccountId } = req.body || {};
+	
+		if (!facebookPageId) {
+					return res.status(400).json({ error: 'facebook_page_id is required' });
+		}
+	
+		try {
+					const connection = await getMetaConnectionByHotelId(hotelId);
+					if (!connection || connection.status !== 'connected' || !connection.access_token) {
+									return res.json({ status: 'access_needed', message: 'Meta access needed' });
+					}
+					const accessToken = decryptToken(connection.access_token);
+					if (!accessToken) {
+									return res.json({ status: 'access_needed', message: 'Meta access needed' });
+					}
+			
+					let pages = [];
+					try {
+									pages = await fetchFacebookPagesWithTokens(accessToken);
+					} catch (graphErr) {
+									console.error('Meta mapping error (fetchFacebookPagesWithTokens)', graphErr.message);
+									return res.json({ status: 'error', message: 'Social partner follow-up needed' });
+					}
+			
+					const matchedPage = pages.find((p) => String(p.id) === String(facebookPageId));
+					if (!matchedPage) {
+									return res.status(400).json({ error: "That Facebook Page is not visible to this hotel's connected Meta account" });
+					}
+			
+					const igAccount = matchedPage.instagram_business_account || null;
+					const resolvedInstagramId = instagramBusinessAccountId || (igAccount ? igAccount.id : null);
+					const igUsername = (igAccount && String(igAccount.id) === String(resolvedInstagramId)) ? (igAccount.username || null) : null;
+			
+					const mapping = await upsertSocialPageMapping({
+									hotelId,
+									facebookPageId: matchedPage.id,
+									facebookPageName: matchedPage.name || null,
+									facebookPageUrl: matchedPage.link || null,
+									instagramBusinessAccountId: resolvedInstagramId,
+									instagramUsername: igUsername,
+									instagramProfileUrl: igUsername ? `https://www.instagram.com/${igUsername}/` : null,
+									mappingStatus: 'manual',
+									mappingConfidence: 100,
+									mappingSource: 'manual'
+					});
+			
+					res.json({ status: 'ok', mapping });
+		} catch (err) {
+					res.status(500).json({ error: 'Failed to save social page mapping', message: err.message });
+		}
+});
+
+// PATCH /hotels/:id/social/activity/invalidate - soft-invalidates (never deletes)
+// social_activity_snapshots and social_posts rows created from specific, known-wrong
+// Facebook Page IDs, e.g. before page mapping existed for this hotel.
+app.patch('/hotels/:id/social/activity/invalidate', async (req, res) => {
+		if (!pool) return res.status(503).json({ error: 'Database not configured' });
+		const hotelId = req.params.id;
+		const { provider, pageIds, reason } = req.body || {};
+	
+		if (provider !== 'facebook' && provider !== 'instagram') {
+					return res.status(400).json({ error: "provider must be 'facebook' or 'instagram'" });
+		}
+		if (!Array.isArray(pageIds) || !pageIds.length) {
+					return res.status(400).json({ error: 'pageIds (non-empty array) is required' });
+		}
+	
+		try {
+					const result = await invalidateSocialActivityForPageIds({ hotelId, provider, pageIds: pageIds.map(String), reason });
+					res.json({ hotel_id: Number(hotelId), provider, page_ids: pageIds, ...result });
+		} catch (err) {
+					res.status(500).json({ error: 'Failed to invalidate social activity', message: err.message });
+		}
 });
 
 app.listen(port, () => {
