@@ -276,7 +276,7 @@ async function searchNearbyHotels(lat, lng, radiusMeters = 20000) {
                           'Content-Type': 'application/json',
                           'X-Goog-Api-Key': key,
                           'X-Goog-FieldMask':
-                                      'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.websiteUri,places.googleMapsUri,places.types,places.businessStatus'
+                                      'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.websiteUri,places.googleMapsUri,places.types,places.businessStatus,places.priceLevel'
                 },
                 body: JSON.stringify({
                           includedTypes: ['lodging'],
