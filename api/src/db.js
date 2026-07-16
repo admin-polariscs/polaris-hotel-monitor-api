@@ -416,3 +416,46 @@ export async function invalidateSocialActivityForPageIds({ hotelId, provider, pa
       	);
   	return { invalidatedSnapshots: snapshots.rows.length, invalidatedPosts: posts.rows.length };
 }
+
+
+// --- Competitive Set Quality Layer (V3.23) persistence -------------------------
+// Additive-only hotel profile columns (see migration 011). One row already exists
+// per hotel in the hotels table - this only updates the new competitive-profile
+// columns on that same row, it never creates a second table.
+export async function updateHotelCompetitiveProfile(hotelId, profile) {
+    const result = await pool.query(
+          `UPDATE hotels SET
+                property_type = $1,
+                      market_type = $2,
+                            chain_scale_proxy = $3,
+                                  price_band_proxy = $4,
+                                        positioning_tags = $5,
+                                              room_count = $6,
+                                                    meeting_or_mice_signal = $7,
+                                                          fnb_signal = $8,
+                                                                spa_signal = $9,
+                                                                      competitive_profile_confidence = $10,
+                                                                            competitive_profile_source = $11,
+                                                                                  competitive_profile_data_gaps = $12,
+                                                                                        competitive_profile_updated_at = now(),
+                                                                                              updated_at = now()
+                                                                                                  WHERE id = $13
+                                                                                                      RETURNING *`,
+          [
+                  profile.property_type || null,
+                  profile.market_type || null,
+                  profile.chain_scale_proxy || null,
+                  profile.price_band_proxy || null,
+                  profile.positioning_tags ? JSON.stringify(profile.positioning_tags) : null,
+                  profile.room_count === undefined ? null : profile.room_count,
+                  profile.meeting_or_mice_signal === undefined ? null : profile.meeting_or_mice_signal,
+                  profile.fnb_signal === undefined ? null : profile.fnb_signal,
+                  profile.spa_signal === undefined ? null : profile.spa_signal,
+                  profile.market_type_confidence || profile.chain_scale_confidence || null,
+                  profile.market_type_source || profile.chain_scale_source || null,
+                  profile.data_gaps ? JSON.stringify(profile.data_gaps) : null,
+                  hotelId
+                ]
+        );
+    return result.rows[0];
+}
