@@ -3,6 +3,7 @@ import cors from 'cors';
 import { runHotelIntelligence, computeRevenueValue } from './engines/intelligence.js';
 import { fetchTripadvisorData, getTripadvisorConnectorStatus, getTripadvisorApiKey, getTripadvisorApiMode, buildTripadvisorOtaEvidenceEntry, TRIPADVISOR_STATUS } from './engines/tripadvisor.js';
 import { getCompetitorsConnectorStatus, getGooglePlacesApiKey, resolveHotelLocation, searchNearbyHotels, classifyCompetitor } from './engines/googlePlaces.js';
+import { buildHotelProfile, resolveDynamicRadius, classifyCandidate } from './engines/competitiveSet.js';
 import { discoverContactPage } from './engines/contactPage.js';
 import {
         getMetaConnectorStatus,
@@ -45,6 +46,7 @@ import {
 		getSocialPageMapping,
 		upsertSocialPageMapping,
 		invalidateSocialActivityForPageIds,
+	  updateHotelCompetitiveProfile,
 } from './db.js';
 
 const app = express();
@@ -683,83 +685,104 @@ app.post('/hotels/:id/competitors/discover', async (req, res) => {
                      locationConfidence = 'high';
                  }
                  
-                 const MAX_RAW_CANDIDATES = 60;
-                 const MAX_PRIMARY = 5;
-                 const MAX_SECONDARY = 7;
-                 const MAX_VISIBLE_TOTAL = 12;
+const mode = (req.query && req.query.mode === 'aspirational_compset') ? 'aspirational_compset' : 'actual_compset';
 
-    const rawCandidates = (await searchNearbyHotels(lat, lng, 20000)).slice(0, MAX_RAW_CANDIDATES);
-                 const classified = rawCandidates.map((c) => classifyCompetitor(c, hotel, { lat, lng }));
+				     const subjectProfile = buildHotelProfile(hotel);
+				     try {
+						       await updateHotelCompetitiveProfile(hotelId, subjectProfile);
+					 } catch (profileErr) {
+						       console.error('Failed to persist hotel competitive profile:', profileErr.message);
+					 }
 
-    const byRank = (a, b) => {
-        if (b.confidence !== a.confidence) return b.confidence - a.confidence;
-        const da = a.distance_km === null ? Infinity : a.distance_km;
-        const db = b.distance_km === null ? Infinity : b.distance_km;
-        return da - db;
-    };
+				     const radius = resolveDynamicRadius(subjectProfile.market_type);
 
-    const primaryAll = classified.filter((c) => c.competitor_type === 'primary_competitor').sort(byRank);
-                 const secondaryAll = classified.filter((c) => c.competitor_type === 'secondary_competitor').sort(byRank);
-                 const nearbyNotComparable = classified.filter((c) => c.competitor_type === 'nearby_not_comparable').sort(byRank);
-                 const excludedList = classified.filter((c) => c.competitor_type === 'excluded');
+				     const MAX_RAW_CANDIDATES = 60;
+				     const MAX_PRIMARY = 5;
+				     const MAX_SECONDARY = 7;
+				     const MAX_ASPIRATIONAL = 5;
+				     const MAX_VISIBLE_TOTAL = 12;
 
-    const primaryVisible = primaryAll.slice(0, MAX_PRIMARY);
-                 let secondaryVisible = secondaryAll.slice(0, MAX_SECONDARY);
-                 if (primaryVisible.length + secondaryVisible.length > MAX_VISIBLE_TOTAL) {
-                     secondaryVisible = secondaryVisible.slice(0, Math.max(0, MAX_VISIBLE_TOTAL - primaryVisible.length));
-                 }
+				     const rawCandidates = (await searchNearbyHotels(lat, lng, radius.searchRadiusMeters)).slice(0, MAX_RAW_CANDIDATES);
+				     const classified = rawCandidates.map((c) => classifyCandidate(c, hotel, subjectProfile, { lat, lng }, radius));
 
-		// Idempotent by design: before storing a fresh Google Places competitive set,
-                     		// any previously-active rows for this hotel are soft-invalidated (never
-                     		// deleted) so repeated discover calls supersede old rows instead of
-                     		// deleting or duplicating them. Only useful candidates (primary/secondary)
-                     		// are persisted - nearby_not_comparable and excluded are returned in the
-                     		// response for transparency only, never stored.
-                     		await pool.query(
-                                        			`UPDATE competitors SET raw_data = COALESCE(raw_data, '{}'::jsonb) || $2::jsonb
-                                                                			 WHERE hotel_id = $1 AND platform_source = 'google_places'
-                                                                                         			   AND (raw_data->>'invalidated' IS DISTINCT FROM 'true')`,
-                                        			[hotelId, JSON.stringify({
-                                                                        				invalidated: true,
-                                                                        				invalidated_reason: 'superseded_by_new_discovery_run',
-                                                                        				invalidated_at: new Date().toISOString()
-                                                                        })]
-                                        		);
+				     const byFit = (a, b) => {
+						       const fa = a.fit_score === undefined ? -1 : a.fit_score;
+						       const fb = b.fit_score === undefined ? -1 : b.fit_score;
+						       if (fb !== fa) return fb - fa;
+						       const da = a.distance_km === null ? Infinity : a.distance_km;
+						       const db = b.distance_km === null ? Infinity : b.distance_km;
+						       return da - db;
+					 };
 
-    for (const item of [...primaryVisible, ...secondaryVisible]) {
-        await storeCompetitor({
-            hotelId,
-            name: item.name,
-            website: item.website || null,
-            city: hotel.city || null,
-            platformSource: 'google_places',
-            confidence: item.confidence,
-            distanceKm: item.distance_km,
-            rawData: item
-        });
-    }
+				     const primaryAll = classified.filter((c) => c.classification === 'primary_competitor').sort(byFit);
+				     const secondaryAll = classified.filter((c) => c.classification === 'secondary_competitor').sort(byFit);
+				     const aspirationalAll = classified.filter((c) => c.classification === 'aspirational_competitor').sort(byFit);
+				     const nearbyNotComparable = classified.filter((c) => c.classification === 'nearby_not_comparable').sort(byFit);
+				     const excludedList = classified.filter((c) => c.classification === 'excluded');
 
-    res.json({
-        hotel_id: Number(hotelId),
-        location_source: locationSource,
-        location_confidence: locationConfidence,
-        contact_page_url: contactPageUrl,
-        primary_competitors: primaryVisible,
-        secondary_competitors: secondaryVisible,
-        nearby_not_comparable: nearbyNotComparable,
-        excluded: excludedList,
-        summary: {
-            raw_candidates_found: rawCandidates.length,
-            primary_count: primaryVisible.length,
-            secondary_count: secondaryVisible.length,
-            nearby_not_comparable_count: nearbyNotComparable.length,
-            excluded_count: excludedList.length
-        }
-    });
-             } catch (err) {
-                 console.error('Competitor discovery error', err);
-                 res.status(500).json({ error: 'Failed to discover competitors', message: err.message });
-             }
+				     const primaryVisible = primaryAll.slice(0, MAX_PRIMARY);
+				     let secondaryVisible = secondaryAll.slice(0, MAX_SECONDARY);
+				     if (primaryVisible.length + secondaryVisible.length > MAX_VISIBLE_TOTAL) {
+						       secondaryVisible = secondaryVisible.slice(0, Math.max(0, MAX_VISIBLE_TOTAL - primaryVisible.length));
+					 }
+				     const aspirationalVisible = aspirationalAll.slice(0, MAX_ASPIRATIONAL);
+
+				     // Idempotent by design: before storing a fresh competitive set, any previously-active
+				     // rows for this hotel are soft-invalidated (never deleted) so repeated discover calls
+				     // supersede old rows instead of deleting or duplicating them. Only included candidates
+				     // (primary/secondary/aspirational) are persisted - nearby_not_comparable and excluded
+				     // are returned in the response for transparency only, never stored.
+				     await pool.query(
+						       `UPDATE competitors SET raw_data = COALESCE(raw_data, '{}'::jsonb) || $2::jsonb
+							          WHERE hotel_id = $1 AND platform_source = 'google_places'
+									         AND (raw_data->>'invalidated' IS DISTINCT FROM 'true')`,
+						       [hotelId, JSON.stringify({
+								           invalidated: true,
+								           invalidated_reason: 'superseded_by_new_discovery_run',
+								           invalidated_at: new Date().toISOString()
+							   })]
+						     );
+
+				     for (const item of [...primaryVisible, ...secondaryVisible, ...aspirationalVisible]) {
+						       await storeCompetitor({
+								           hotelId,
+								           name: item.name,
+								           website: item.website || null,
+								           city: hotel.city || null,
+								           platformSource: 'google_places',
+								           confidence: item.fit_confidence,
+								           distanceKm: item.distance_km,
+								           rawData: item
+							   });
+					 }
+
+				     res.json({
+						       hotel_id: Number(hotelId),
+						       mode,
+						       message: 'Polaris discovered nearby hotel candidates and classified likely competitive relevance.',
+						       wording: 'Suggested competitive set, pending hotelier review.',
+						       location_source: locationSource,
+						       location_confidence: locationConfidence,
+						       contact_page_url: contactPageUrl,
+						       subject_hotel_profile: subjectProfile,
+						       primary_competitors: primaryVisible,
+						       secondary_competitors: secondaryVisible,
+						       aspirational_competitors: aspirationalVisible,
+						       nearby_not_comparable: nearbyNotComparable,
+						       excluded: excludedList,
+						       summary: {
+								           raw_candidates_found: rawCandidates.length,
+								           primary_count: primaryVisible.length,
+								           secondary_count: secondaryVisible.length,
+								           aspirational_count: aspirationalVisible.length,
+								           nearby_not_comparable_count: nearbyNotComparable.length,
+								           excluded_count: excludedList.length
+							   }
+					 });
+			 } catch (err) {
+				     console.error('Competitor discovery error', err);
+				     res.status(500).json({ error: 'Failed to discover competitors', message: err.message });
+			 }
 });
 
 // GET /hotels/:id/competitors - cached Google Places competitive set for this hotel.
@@ -773,17 +796,22 @@ app.get('/hotels/:id/competitors', async (req, res) => {
             [req.params.id]
             );
         const rows = result.rows;
-        const primary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'primary_competitor');
-        const secondary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'secondary_competitor');
-        res.json({
-            hotel_id: Number(req.params.id),
-            primary_competitors: primary,
-            secondary_competitors: secondary,
-            summary: {
-                primary_count: primary.length,
-                secondary_count: secondary.length
-            }
-        });
+        const primary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'primary_competitor');
+		    const secondary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'secondary_competitor');
+		    const aspirational = rows.filter((r) => r.raw_data && r.raw_data.classification === 'aspirational_competitor');
+		    res.json({
+				      hotel_id: Number(req.params.id),
+				      message: 'Polaris discovered nearby hotel candidates and classified likely competitive relevance.',
+				      wording: 'Suggested competitive set, pending hotelier review.',
+				      primary_competitors: primary,
+				      secondary_competitors: secondary,
+				      aspirational_competitors: aspirational,
+				      summary: {
+						          primary_count: primary.length,
+						          secondary_count: secondary.length,
+						          aspirational_count: aspirational.length
+					  }
+			});
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
     }
