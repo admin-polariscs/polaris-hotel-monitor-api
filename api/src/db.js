@@ -311,10 +311,108 @@ export async function insertSocialActivitySnapshot({
 
 // Most recent snapshots for a hotel/provider, newest first. Used to build the
 // customer-safe response and to compute trend deltas (row 0 = latest, row 1 = previous).
-export async function getRecentSocialActivitySnapshots(hotelId, provider, limit = 2) {
-  const result = await pool.query(
-    'SELECT * FROM social_activity_snapshots WHERE hotel_id = $1 AND provider = $2 ORDER BY snapshot_date DESC LIMIT $3',
-    [hotelId, provider, limit]
-    );
-  return result.rows;
+export async function getRecentSocialActivitySnapshots(hotelId, provider, limit = 2, profileId = null) {
+  	const result = await pool.query(
+      		`SELECT * FROM social_activity_snapshots
+          		 WHERE hotel_id = $1 AND provider = $2
+               		   AND (raw_data->>'invalidated' IS DISTINCT FROM 'true')
+                     		   AND ($4::text IS NULL OR profile_id = $4)
+                           		 ORDER BY snapshot_date DESC LIMIT $3`,
+      		[hotelId, provider, limit, profileId]
+      	);
+  	return result.rows;
+}
+
+// --- Meta Page Mapping (V3.21) persistence -------------------------------------
+// One social_page_mappings row per hotel. Records which Facebook Page / Instagram
+// Business account has been confirmed - via auto-match or manual confirmation - as
+// the correct one for that hotel's social monitoring, so /social/sync never has to
+// guess by picking "the first Page returned by Meta".
+export async function getSocialPageMapping(hotelId) {
+  	const result = await pool.query(
+      		'SELECT * FROM social_page_mappings WHERE hotel_id = $1',
+      		[hotelId]
+      	);
+  	return result.rows[0] || null;
+}
+
+export async function upsertSocialPageMapping({
+  	hotelId,
+  	facebookPageId,
+  	facebookPageName,
+  	facebookPageUrl,
+  	instagramBusinessAccountId,
+  	instagramUsername,
+  	instagramProfileUrl,
+  	mappingStatus,
+  	mappingConfidence,
+  	mappingSource
+}) {
+  	const result = await pool.query(
+      		`INSERT INTO social_page_mappings (
+          			hotel_id, facebook_page_id, facebook_page_name, facebook_page_url,
+                			instagram_business_account_id, instagram_username, instagram_profile_url,
+                      			mapping_status, mapping_confidence, mapping_source, mapped_at, updated_at
+                            		)
+                                		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
+                                    		ON CONFLICT (hotel_id) DO UPDATE SET
+                                        			facebook_page_id = EXCLUDED.facebook_page_id,
+                                              			facebook_page_name = EXCLUDED.facebook_page_name,
+                                                    			facebook_page_url = EXCLUDED.facebook_page_url,
+                                                          			instagram_business_account_id = EXCLUDED.instagram_business_account_id,
+                                                                			instagram_username = EXCLUDED.instagram_username,
+                                                                      			instagram_profile_url = EXCLUDED.instagram_profile_url,
+                                                                            			mapping_status = EXCLUDED.mapping_status,
+                                                                                  			mapping_confidence = EXCLUDED.mapping_confidence,
+                                                                                        			mapping_source = EXCLUDED.mapping_source,
+                                                                                              			mapped_at = now(),
+                                                                                                    			updated_at = now()
+                                                                                                          		RETURNING *`,
+      		[
+            			hotelId,
+            			facebookPageId || null,
+            			facebookPageName || null,
+            			facebookPageUrl || null,
+            			instagramBusinessAccountId || null,
+            			instagramUsername || null,
+            			instagramProfileUrl || null,
+            			mappingStatus,
+            			mappingConfidence === undefined ? null : mappingConfidence,
+            			mappingSource || null
+            		]
+      	);
+  	return result.rows[0];
+}
+
+// Soft-invalidates (never deletes) social_activity_snapshots and social_posts rows
+// that were created from an incorrect Facebook Page ID, e.g. before page mapping
+// existed. Snapshots are matched by their stored profile_id. Posts have no separate
+// page/profile column, so they are matched using the Facebook post ID convention
+// "{page_id}_{post_id}" via an exact prefix check (never a wildcard LIKE, to avoid
+// accidental partial-ID matches).
+export async function invalidateSocialActivityForPageIds({ hotelId, provider, pageIds, reason }) {
+  	const metadata = JSON.stringify({
+      		invalidated: true,
+      		invalidated_reason: reason || null,
+      		invalidated_at: new Date().toISOString()
+    });
+  	const snapshots = await pool.query(
+      		`UPDATE social_activity_snapshots SET raw_data = COALESCE(raw_data, '{}'::jsonb) || $1::jsonb
+          		 WHERE hotel_id = $2 AND provider = $3 AND profile_id = ANY($4::text[])
+               		   AND (raw_data->>'invalidated' IS DISTINCT FROM 'true')
+                     		 RETURNING id`,
+      		[metadata, hotelId, provider, pageIds]
+      	);
+  	const posts = await pool.query(
+      		`UPDATE social_posts SET raw_data = COALESCE(raw_data, '{}'::jsonb) || $1::jsonb
+          		 WHERE hotel_id = $2 AND provider = $3
+               		   AND (raw_data->>'invalidated' IS DISTINCT FROM 'true')
+                     		   AND EXISTS (
+                           			   SELECT 1 FROM unnest($4::text[]) AS page_id
+                                   			   WHERE left(provider_post_id, length(page_id) + 1) = page_id || '_'
+                                           		   )
+                                                 		 RETURNING id`,
+      		[metadata, hotelId, provider, pageIds]
+      	);
+  	return { invalidatedSnapshots: snapshots.rows.length, invalidatedPosts: posts.rows.length };
 }
