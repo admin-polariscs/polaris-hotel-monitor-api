@@ -796,17 +796,22 @@ app.get('/hotels/:id/competitors', async (req, res) => {
             [req.params.id]
             );
         const rows = result.rows;
-        const primary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'primary_competitor');
-        const secondary = rows.filter((r) => r.raw_data && r.raw_data.competitor_type === 'secondary_competitor');
-        res.json({
-            hotel_id: Number(req.params.id),
-            primary_competitors: primary,
-            secondary_competitors: secondary,
-            summary: {
-                primary_count: primary.length,
-                secondary_count: secondary.length
-            }
-        });
+        const primary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'primary_competitor');
+		    const secondary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'secondary_competitor');
+		    const aspirational = rows.filter((r) => r.raw_data && r.raw_data.classification === 'aspirational_competitor');
+		    res.json({
+				      hotel_id: Number(req.params.id),
+				      message: 'Polaris discovered nearby hotel candidates and classified likely competitive relevance.',
+				      wording: 'Suggested competitive set, pending hotelier review.',
+				      primary_competitors: primary,
+				      secondary_competitors: secondary,
+				      aspirational_competitors: aspirational,
+				      summary: {
+						          primary_count: primary.length,
+						          secondary_count: secondary.length,
+						          aspirational_count: aspirational.length
+					  }
+			});
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
     }
