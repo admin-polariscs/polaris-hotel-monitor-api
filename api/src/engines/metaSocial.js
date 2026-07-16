@@ -201,7 +201,7 @@ export async function fetchFacebookPages(accessToken) {
 // Facebook Pages with page access token + fan/follower counts + linked IG account.
 export async function fetchFacebookPagesWithTokens(accessToken) {
     const params = new URLSearchParams({
-        fields: 'id,name,link,fan_count,followers_count,access_token,instagram_business_account{id,username,name,profile_picture_url}',
+        fields: 'id,name,link,website,fan_count,followers_count,access_token,location{city,country},instagram_business_account{id,username,name,profile_picture_url}',
         access_token: accessToken
     });
     const data = await graphFetch(`${GRAPH_BASE}/me/accounts?${params.toString()}`);
@@ -238,4 +238,160 @@ export async function fetchInstagramMedia(igUserId, pageAccessToken, limit = 25)
     });
     const data = await graphFetch(`${GRAPH_BASE}/${igUserId}/media?${params.toString()}`);
     return Array.isArray(data.data) ? data.data : [];
+}
+
+// --- Meta Page Mapping (V3.21) matching -----------------------------------------
+// Scores a single Facebook Page (as returned by fetchFacebookPagesWithTokens)
+// against a hotel's known identity signals: website-detected Facebook/Instagram
+// links, hotel domain/name, and city/country. This is the only place a Page is
+// ever chosen for a hotel - "the first Page returned by Meta" is never trusted.
+const NAME_STOPWORDS = new Set(['hotel', 'the', 'and', 'de', 'le', 'la', 'inn', 'suites', 'resort']);
+
+function normalizeText(value) {
+    	return (value || '')
+    		.toLowerCase()
+    		.normalize('NFKD')
+    		.replace(/[\u0300-\u036f]/g, '')
+    		.replace(/[^a-z0-9]+/g, ' ')
+    		.trim();
+}
+
+function nameTokens(value) {
+    	return normalizeText(value).split(' ').filter((t) => t.length > 1 && !NAME_STOPWORDS.has(t));
+}
+
+function extractDomain(url) {
+    	if (!url) return null;
+    	try {
+            		const u = new URL(url.startsWith('http') ? url : `https://${url}`);
+            		return u.hostname.replace(/^www\./, '').toLowerCase();
+        } catch (e) {
+            		return null;
+        }
+}
+
+function normalizeUrlForCompare(url) {
+    	return (url || '')
+    		.toLowerCase()
+    		.replace(/^https?:\/\//, '')
+    		.replace(/^www\./, '')
+    		.replace(/\/$/, '')
+    		.split('?')[0];
+}
+
+function urlsMatch(a, b) {
+    	if (!a || !b) return false;
+    	return normalizeUrlForCompare(a) === normalizeUrlForCompare(b);
+}
+
+function usernameFromInstagramUrl(url) {
+    	if (!url) return null;
+    	const m = url.match(/instagram\.com\/([^\/?]+)/i);
+    	return m ? m[1].toLowerCase() : null;
+}
+
+// Returns { score, reasons[] } for one Facebook Page candidate against one hotel.
+// Positive signals (exact URL/username match, domain match, name match, city/
+// country match) add points; conflicting domain/name subtract points. Scoring
+// mirrors the V3.21 spec: >=85 auto_matched, 60-84 needs_confirmation, else not_mapped.
+export function scoreFacebookPageCandidate(page, hotel) {
+    	let score = 0;
+    	const reasons = [];
+
+	const socialLinks = (hotel && hotel.extracted_social_links) || {};
+    	const hotelFacebookUrl = socialLinks.facebook || null;
+    	const hotelInstagramUrl = socialLinks.instagram || null;
+    	const hotelDomain = (hotel && hotel.domain) || extractDomain(hotel && hotel.website);
+    	const igAccount = page.instagram_business_account || null;
+    	const igUsername = igAccount ? (igAccount.username || null) : null;
+
+	if (hotelFacebookUrl && page.link && urlsMatch(hotelFacebookUrl, page.link)) {
+        		score += 100;
+        		reasons.push('exact_facebook_url_match');
+    }
+
+	const hotelIgUsername = usernameFromInstagramUrl(hotelInstagramUrl);
+    	if (hotelIgUsername && igUsername && hotelIgUsername === igUsername.toLowerCase()) {
+            		score += 95;
+            		reasons.push('exact_instagram_username_match');
+        }
+
+	const pageWebsiteDomain = extractDomain(page.website);
+    	let domainConflict = false;
+    	if (hotelDomain && pageWebsiteDomain) {
+            		if (pageWebsiteDomain === hotelDomain) {
+                        			score += 90;
+                        			reasons.push('page_website_domain_match');
+                    } else {
+                        			domainConflict = true;
+                    }
+        }
+
+	const hotelTokens = new Set(nameTokens(hotel && hotel.name));
+    	const pageTokens = new Set(nameTokens(page.name));
+    	let nameConflict = false;
+    	if (hotelTokens.size && pageTokens.size) {
+            		const intersection = [...hotelTokens].filter((t) => pageTokens.has(t));
+            		const union = new Set([...hotelTokens, ...pageTokens]);
+            		const jaccard = intersection.length / union.size;
+            		const containment = intersection.length / Math.min(hotelTokens.size, pageTokens.size);
+            		if (jaccard >= 0.6 || containment >= 0.8) {
+                        			score += 80;
+                        			reasons.push('strong_name_match');
+                    } else if (intersection.length > 0) {
+                        			score += 40;
+                        			reasons.push('partial_name_match');
+                    } else {
+                        			nameConflict = true;
+                    }
+        }
+
+	const hotelCity = ((hotel && hotel.city) || '').toLowerCase().trim();
+    	const hotelCountry = ((hotel && hotel.country) || '').toLowerCase().trim();
+    	const pageCity = (page.location && page.location.city ? page.location.city : '').toLowerCase().trim();
+    	const pageCountry = (page.location && page.location.country ? page.location.country : '').toLowerCase().trim();
+    	if ((hotelCity && pageCity && hotelCity === pageCity) || (hotelCountry && pageCountry && hotelCountry === pageCountry)) {
+            		score += 10;
+            		reasons.push('city_or_country_match');
+        }
+
+	if (domainConflict && nameConflict) {
+        		score -= 30;
+        		reasons.push('conflicting_domain_and_name');
+    } else if (domainConflict) {
+        		score -= 15;
+        		reasons.push('conflicting_domain');
+    } else if (nameConflict && reasons.length === 0) {
+        		score -= 20;
+        		reasons.push('conflicting_name');
+    }
+
+	return { score, reasons };
+}
+
+// mapping_status tier for a given score, per the V3.21 thresholds.
+export function mappingStatusForScore(score) {
+    	if (score >= 85) return 'auto_matched';
+    	if (score >= 60) return 'needs_confirmation';
+    	return 'not_mapped';
+}
+
+// Builds the customer/admin-safe candidate shape for GET /hotels/:id/social/candidates.
+// Never includes access_token or any other raw Graph API/debug data.
+export function buildSocialPageCandidate(page, hotel, isTopCandidate) {
+    	const { score, reasons } = scoreFacebookPageCandidate(page, hotel);
+    	const igAccount = page.instagram_business_account || null;
+    	const igUsername = igAccount ? (igAccount.username || null) : null;
+    	return {
+            		page_id: page.id,
+            		page_name: page.name || null,
+            		page_url: page.link || null,
+            		page_website: page.website || null,
+            		linked_instagram_business_account_id: igAccount ? igAccount.id : null,
+            		linked_instagram_username: igUsername,
+            		linked_instagram_profile_url: igUsername ? `https://www.instagram.com/${igUsername}/` : null,
+            		match_score: score,
+            		match_reasons: reasons,
+            		recommended: !!isTopCandidate && score >= 60
+        };
 }
