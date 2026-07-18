@@ -795,23 +795,47 @@ app.get('/hotels/:id/competitors', async (req, res) => {
                         "SELECT id, name, website, city, platform_source, confidence, distance_km, raw_data, first_seen_at, last_seen_at FROM competitors WHERE hotel_id = $1 AND platform_source = 'google_places' AND (raw_data->>'invalidated' IS DISTINCT FROM 'true') ORDER BY confidence DESC NULLS LAST, distance_km ASC NULLS LAST",
             [req.params.id]
             );
-        const rows = result.rows;
-        const primary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'primary_competitor');
-		    const secondary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'secondary_competitor');
-		    const aspirational = rows.filter((r) => r.raw_data && r.raw_data.classification === 'aspirational_competitor');
-		    res.json({
-				      hotel_id: Number(req.params.id),
-				      message: 'Polaris discovered nearby hotel candidates and classified likely competitive relevance.',
-				      wording: 'Suggested competitive set, pending hotelier review.',
-				      primary_competitors: primary,
-				      secondary_competitors: secondary,
-				      aspirational_competitors: aspirational,
-				      summary: {
-						          primary_count: primary.length,
-						          secondary_count: secondary.length,
-						          aspirational_count: aspirational.length
-					  }
-			});
+		const rows = result.rows;
+        // V3.23.1 Part A: normalize the API shape. Mirror the V3.23 classification
+					// fields at the top level of every item (previously only available nested
+					// inside raw_data), so frontend-safe clients can read item.classification,
+					// item.fit_score, item.fit_confidence etc. directly. confidence, distance_km
+					// and raw_data are kept as-is for backwards compatibility. Note: the DB
+					// "confidence" column stores fit_confidence, not fit_score - do not treat
+					// row.confidence as a 0-100 score.
+					function normalizeCompetitorRow(row) {
+										const rd = (row && row.raw_data) || {};
+										const normalized = {
+																...row,
+																classification: rd.classification,
+																fit_score: rd.fit_score,
+																fit_confidence: rd.fit_confidence,
+																fit_reasons: rd.fit_reasons || [],
+																weaknesses: rd.weaknesses || [],
+																data_gaps: rd.data_gaps || []
+										};
+										if (rd.exclusion_reason) normalized.exclusion_reason = rd.exclusion_reason;
+										if (rd.exclusion_reasons) normalized.exclusion_reasons = rd.exclusion_reasons;
+										if (rd.mode || rd.benchmark_mode) normalized.mode = rd.mode || rd.benchmark_mode;
+										return normalized;
+					}
+
+					const primary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'primary_competitor').map(normalizeCompetitorRow);
+					const secondary = rows.filter((r) => r.raw_data && r.raw_data.classification === 'secondary_competitor').map(normalizeCompetitorRow);
+					const aspirational = rows.filter((r) => r.raw_data && r.raw_data.classification === 'aspirational_competitor').map(normalizeCompetitorRow);
+					res.json({
+										hotel_id: Number(req.params.id),
+										message: 'Polaris discovered nearby hotel candidates and classified likely competitive relevance.',
+										wording: 'Suggested competitive set, pending hotelier review.',
+										primary_competitors: primary,
+										secondary_competitors: secondary,
+										aspirational_competitors: aspirational,
+										summary: {
+																primary_count: primary.length,
+																secondary_count: secondary.length,
+																aspirational_count: aspirational.length
+										}
+					});
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch competitors', message: err.message });
     }
