@@ -176,6 +176,11 @@ return {
 // Classification-relevance radius tiers (NOT the raw Google Places search radius -
 // the search radius stays generous so borderline/excluded candidates like a distant
 // airport hotel are still fetched and explained, never silently hidden).
+// V3.25A: for city_center (and suburban/mixed) markets, searchRadiusMeters now follows the
+// classification secondaryKm tier instead of a flat 20km. Combined with DISTANCE rankPreference
+// in searchNearbyHotels(), this fixes a candidate-RECALL problem in dense city centers (a closer
+// heritage/luxury hotel being crowded out of the raw Nearby Search results by more "popular"
+// hotels farther away). Airport/resort search radii are intentionally left wider, unchanged.
 export function resolveDynamicRadius(marketType) {
       switch (marketType) {
             case 'airport':
@@ -184,10 +189,10 @@ export function resolveDynamicRadius(marketType) {
                   return { primaryKm: 10, secondaryKm: 30, searchRadiusMeters: 40000 };
             case 'suburban':
             case 'mixed':
-                  return { primaryKm: 3, secondaryKm: 10, searchRadiusMeters: 20000 };
+                  return { primaryKm: 3, secondaryKm: 10, searchRadiusMeters: 10000 };
             case 'city_center':
             default:
-                  return { primaryKm: 2, secondaryKm: 5, searchRadiusMeters: 20000 };
+                  return { primaryKm: 2, secondaryKm: 5, searchRadiusMeters: 5000 };
       }
 }
 
