@@ -281,6 +281,7 @@ async function searchNearbyHotels(lat, lng, radiusMeters = 20000) {
                 body: JSON.stringify({
                           includedTypes: ['lodging'],
                           maxResultCount: 20,
+                          rankPreference: 'DISTANCE', // V3.25A: rank by distance, not popularity, for tighter city-center recall
                           locationRestriction: {
                                       circle: {
                                                     center: { latitude: lat, longitude: lng },
