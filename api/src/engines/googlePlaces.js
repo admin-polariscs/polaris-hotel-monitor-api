@@ -265,11 +265,12 @@ async function resolveHotelLocation(hotel) {
 // Searches for lodging businesses within radiusMeters of the given coordinates using
 // Google Places Nearby Search (New). Returns the raw place results (capped list, no
 // pagination beyond what the API returns in a single call).
-async function searchNearbyHotels(lat, lng, radiusMeters = 20000) {
+// Runs a single Google Places Nearby Search (New) pass with the given rankPreference.
+// Returns the raw place results (single call, no pagination beyond the API response).
+async function nearbySearchOnce(lat, lng, radiusMeters, rankPreference) {
     const key = getGooglePlacesApiKey();
     if (!key) return [];
-
-  try {
+    try {
         const r = await fetch(`${PLACES_API_BASE}/places:searchNearby`, {
                 method: 'POST',
                 headers: {
@@ -281,7 +282,7 @@ async function searchNearbyHotels(lat, lng, radiusMeters = 20000) {
                 body: JSON.stringify({
                           includedTypes: ['lodging'],
                           maxResultCount: 20,
-                          rankPreference: 'DISTANCE', // V3.25A: rank by distance, not popularity, for tighter city-center recall
+                          rankPreference,
                           locationRestriction: {
                                       circle: {
                                                     center: { latitude: lat, longitude: lng },
@@ -292,14 +293,56 @@ async function searchNearbyHotels(lat, lng, radiusMeters = 20000) {
         });
         const data = await r.json().catch(() => null);
         if (!r.ok) {
-                console.error('Google Places nearby search error', { status: r.status, data });
+                console.error('Google Places nearby search error', { status: r.status, rankPreference, data });
                 return [];
         }
         return (data && Array.isArray(data.places)) ? data.places : [];
-  } catch (err) {
+    } catch (err) {
         console.error('Google Places nearby search request failed', err.message);
         return [];
-  }
+    }
+}
+
+// V3.25A.1: Hybrid candidate recall. Pure DISTANCE ranking floods ultra-dense city
+// centers with the literal nearest micro-listings and pushes out prominent nearby
+// hotels. Instead we run a relevance/prominence pass over the (tighter) radius, plus a
+// supplemental distance-ranked pass over a small inner radius, then merge + dedupe.
+// Each result is tagged with candidate_source so downstream can explain provenance.
+// Universal - no hardcoded hotels or cities.
+const INNER_DISTANCE_RADIUS_METERS = 2000;
+
+async function searchNearbyHotels(lat, lng, radiusMeters = 20000) {
+    const key = getGooglePlacesApiKey();
+    if (!key) return [];
+
+    const innerRadius = Math.min(radiusMeters, INNER_DISTANCE_RADIUS_METERS);
+
+    const [popularityResults, distanceResults] = await Promise.all([
+        nearbySearchOnce(lat, lng, radiusMeters, 'POPULARITY'),
+        nearbySearchOnce(lat, lng, innerRadius, 'DISTANCE')
+    ]);
+
+    const merged = [];
+    const seenIds = new Set();
+    const addAll = (places, source) => {
+        for (const p of places) {
+            if (!p) continue;
+            const id = p.id || null;
+            if (id && seenIds.has(id)) continue;
+            const nm = (p.displayName && p.displayName.text) || '';
+            const dup = merged.find((m) => {
+                const mn = (m.displayName && m.displayName.text) || '';
+                return mn && nm && nameSimilarity(mn, nm) >= 0.8;
+            });
+            if (dup) continue;
+            if (id) seenIds.add(id);
+            merged.push({ ...p, candidate_source: source });
+        }
+    };
+    addAll(popularityResults, 'nearby_popularity_search');
+    addAll(distanceResults, 'nearby_distance_search');
+
+    return merged;
 }
 
 // Scores and classifies a single Google Places result against the source hotel.
