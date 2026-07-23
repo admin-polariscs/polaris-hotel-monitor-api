@@ -41,6 +41,11 @@ const BNB_RE = /\b(b\s*&\s*b|bed\s*and\s*breakfast|guest\s*house|guesthouse)\b/i
 const HOLIDAY_RENTAL_RE = /\b(holiday\s*home|vacation\s*rental|holiday\s*rental)\b/i;
 const AIRPORT_RE = /\b(airport|schiphol|luchthaven)\b/i;
 const RESORT_RE = /\b(resort|wellness)\b/i;
+// V3.25A.1: obvious non-hotel micro-listings (individual apartments/rooms, holiday rentals,
+// tour "experiences", concierge/key services). These are not comparable to a full-service
+// hotel and should not flood a city-center hotel's competitor set. Universal name patterns
+// only - no hardcoded hotels or cities. Guarded by a real 'hotel' type check at the call site.
+const NON_HOTEL_MICRO_RE = /\b(entire\s+(apartment|home|place)|\d+\s*-?\s*bedroom|apartment|apartments|studio|holiday\s*apartment|vacation\s*apartment|short\s*stay|long\s*stay|experience|experiences|concierge|key\s*service|sleutels|self[-\s]?catering)\b/i;
 
 const EXCLUDE_STRONG_TYPES = new Set(['campground', 'rv_park', 'mobile_home_park', 'farmstay', 'cottage']);
 
@@ -252,6 +257,16 @@ if (types.includes('private_guest_room') || HOLIDAY_RENTAL_RE.test(n)) {
       };
 }
 
+if (NON_HOTEL_MICRO_RE.test(n) && !types.includes('hotel')) {
+      return {
+            excluded: true,
+            exclusion_reason: 'not_comparable_property_type',
+            exclusion_reasons: ['non_hotel_micro_listing_apartment_room_experience_or_service'],
+            exclusion_confidence: 0.75,
+            source_signals: ['name_pattern:non_hotel_micro_listing']
+      };
+}
+
 if (AIRPORT_RE.test(n) && subjectProfile.market_type !== 'airport') {
       return { excluded: false, downgrade: 'airport_cluster_mismatch', downgrade_confidence: 0.7, source_signals: ['name_pattern:airport'] };
 }
@@ -408,7 +423,8 @@ const base = {
       distance_km,
       rating,
       review_count,
-      google_maps_url: place.googleMapsUri || null
+      google_maps_url: place.googleMapsUri || null,
+      candidate_source: place.candidate_source || null
 };
 
 if (sameHotel) {
